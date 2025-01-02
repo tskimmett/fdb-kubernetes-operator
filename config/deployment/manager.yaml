@@ -29,11 +29,11 @@ spec:
           emptyDir: {}
       serviceAccountName: fdb-kubernetes-operator-controller-manager
       initContainers:
-        - name: foundationdb-kubernetes-init-6-2
-          image: foundationdb/foundationdb-kubernetes-sidecar:6.2.30-1
+        - name: foundationdb-kubernetes-init-7-3
+          image: localhost:5001/tskimmett/fdb-sidecar-arm:7.3.56
           args:
             - "--copy-library"
-            - "6.2"
+            - "7.3"
             - "--copy-binary"
             - "fdbcli"
             - "--copy-binary"
@@ -41,41 +41,7 @@ spec:
             - "--copy-binary"
             - "fdbrestore"
             - "--output-dir"
-            - "/var/output-files/6.2.30"
-            - "--init-mode"
-          volumeMounts:
-            - name: fdb-binaries
-              mountPath: /var/output-files
-        - name: foundationdb-kubernetes-init-6-3
-          image: foundationdb/foundationdb-kubernetes-sidecar:6.3.24-1
-          args:
-            - "--copy-library"
-            - "6.3"
-            - "--copy-binary"
-            - "fdbcli"
-            - "--copy-binary"
-            - "fdbbackup"
-            - "--copy-binary"
-            - "fdbrestore"
-            - "--output-dir"
-            - "/var/output-files/6.3.24"
-            - "--init-mode"
-          volumeMounts:
-            - name: fdb-binaries
-              mountPath: /var/output-files
-        - name: foundationdb-kubernetes-init-7-1
-          image: foundationdb/foundationdb-kubernetes-sidecar:7.1.26-1
-          args:
-            - "--copy-library"
-            - "7.1"
-            - "--copy-binary"
-            - "fdbcli"
-            - "--copy-binary"
-            - "fdbbackup"
-            - "--copy-binary"
-            - "fdbrestore"
-            - "--output-dir"
-            - "/var/output-files/7.1.26"
+            - "/var/output-files/7.3.56"
             - "--init-mode"
           volumeMounts:
             - name: fdb-binaries
@@ -83,7 +49,7 @@ spec:
       containers:
         - command:
             - /manager
-          image: foundationdb/fdb-kubernetes-operator:v1.52.0
+          image: localhost:5001/tskimmett/fdb-kubernetes-operator:latest
           name: manager
           env:
             - name: WATCH_NAMESPACE

@@ -10,6 +10,10 @@ ifneq "$(FDB_WEBSITE)" ""
 	img_build_args := $(img_build_args) --build-arg FDB_WEBSITE=$(FDB_WEBSITE)
 endif
 
+ifneq "$(FDB_VERSION)" ""
+	img_build_args := $(img_build_args) --build-arg FDB_VERSION=$(FDB_VERSION)
+endif
+
 # Support overriding the default build platform
 ifneq "$(BUILD_PLATFORM)" ""
 	img_build_args := $(img_build_args) --platform $(BUILD_PLATFORM)

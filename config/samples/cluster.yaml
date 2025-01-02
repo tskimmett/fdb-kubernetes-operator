@@ -1,8 +1,21 @@
 apiVersion: apps.foundationdb.org/v1beta2
 kind: FoundationDBCluster
 metadata:
-  name: test-cluster
+  name: fdb-cluster
 spec:
+  version: 7.3.56
+  mainContainer:
+    imageConfigs:
+      - baseImage: ghcr.io/tskimmett/fdb-arm
+  sidecarContainer:
+    imageConfigs:
+      - baseImage: ghcr.io/tskimmett/fdb-sidecar-arm
+    enableLivenessProbe: true
+    enableReadinessProbe: false
+  databaseConfiguration:
+    redundancy_mode: single
+    storage_engine: ssd-redwood-1
+    storage_migration_type: aggressive
   automationOptions:
     replacements:
       enabled: true
@@ -12,7 +25,7 @@ spec:
   labels:
     filterOnOwnerReference: false
     matchLabels:
-      foundationdb.org/fdb-cluster-name: test-cluster
+      foundationdb.org/fdb-cluster-name: fdb-cluster
     processClassLabels:
     - foundationdb.org/fdb-process-class
     processGroupIDLabels:
@@ -63,8 +76,4 @@ spec:
               storage: 16G
   routing:
     defineDNSLocalityFields: true
-  sidecarContainer:
-    enableLivenessProbe: true
-    enableReadinessProbe: false
   useExplicitListenAddress: true
-  version: 7.1.26
