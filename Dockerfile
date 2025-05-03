@@ -16,8 +16,8 @@ RUN if [ "$TARGETPLATFORM" != "linux/amd64" && "$TARGETPLATFORM" != "linux/arm64
 
 RUN set -eux && \
     curl --fail -L "${FDB_WEBSITE}/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb" -o foundationdb-clients_${FDB_VERSION}-1_amd64.deb && \
-    curl --fail -L "${FDB_WEBSITE}/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb" -o foundationdb-clients_${FDB_VERSION}-1_amd64.deb.sha256
-    sha256sum -c foundationdb-clients_${FDB_VERSION}-1_amd64.deb.sha256 && \
+    curl --fail -L "${FDB_WEBSITE}/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb.sha256" -o foundationdb-clients_${FDB_VERSION}-1_amd64.deb.sha256 && \
+    sha256sum -c foundationdb-clients_${FDB_VERSION}-1_amd64.deb.sha256
 
 # download arm version of libfdb_c and amd version of the headers
 RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
@@ -85,8 +85,8 @@ RUN set -eux && \
     curl --fail -L "${FDB_WEBSITE}/${FDB_VERSION}/foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm" -o foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm && \
     curl --fail -L "${FDB_WEBSITE}/${FDB_VERSION}/foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm.sha256" -o foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm.sha256 && \
     microdnf install -y glibc pkg-config cpio && \
-    microdnf clean all
-    sha256sum -c foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm.sha256 && \
+    microdnf clean all && \
+    sha256sum -c foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm.sha256
 
 RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
     curl --create-dirs -Lo /lib64/libfdb_c.so "${FDB_WEBSITE}/${FDB_VERSION}/libfdb_c.aarch64.so" && \
