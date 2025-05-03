@@ -23,17 +23,18 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal/coordinator"
+
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal/coordinator"
 
 	"github.com/go-logr/logr"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal/locality"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal/locality"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
 
 	corev1 "k8s.io/api/core/v1"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 )
 
 // generateInitialClusterFile provides a reconciliation step for generating the
@@ -97,7 +98,7 @@ func (g generateInitialClusterFile) reconcile(ctx context.Context, r *Foundation
 	if cluster.Spec.PartialConnectionString.DatabaseName != "" {
 		clusterName = cluster.Spec.PartialConnectionString.DatabaseName
 	} else {
-		clusterName = connectionStringNameRegex.ReplaceAllString(cluster.Name, "_")
+		clusterName = fdbv1beta2.SanitizeConnectionStringDescription(cluster.Name)
 	}
 
 	connectionString := fdbv1beta2.ConnectionString{DatabaseName: clusterName}
@@ -129,8 +130,19 @@ func (g generateInitialClusterFile) reconcile(ctx context.Context, r *Foundation
 		processLocality = append(processLocality, currentLocality)
 	}
 
+	limits := locality.GetHardLimits(cluster)
+	// Only for the three data hall mode we allow a less restrictive selection of the initial coordinators.
+	// The reason for this is that we don't know the data_hall locality until the fdbserver processes are running
+	// as they will report the data_hall locality. So this is a workaround to allow an easy bring up of a three_data_hall
+	// cluster with the unified image. Once the processes are reporting and the cluster is configured, the operator
+	// will choose 9 coordinators spread across the 3 data halls.
+	if cluster.Spec.DatabaseConfiguration.RedundancyMode == fdbv1beta2.RedundancyModeThreeDataHall {
+		count = 3
+		delete(limits, fdbv1beta2.FDBLocalityDataHallKey)
+	}
+
 	coordinators, err := locality.ChooseDistributedProcesses(cluster, processLocality, count, locality.ProcessSelectionConstraint{
-		HardLimits: locality.GetHardLimits(cluster),
+		HardLimits: limits,
 	})
 	if err != nil {
 		return &requeue{curError: err}
@@ -138,6 +150,12 @@ func (g generateInitialClusterFile) reconcile(ctx context.Context, r *Foundation
 
 	for _, currentLocality := range coordinators {
 		connectionString.Coordinators = append(connectionString.Coordinators, coordinator.GetCoordinatorAddress(cluster, currentLocality).String())
+	}
+
+	// Ensure that the connection string is in a valid format.
+	err = connectionString.Validate()
+	if err != nil {
+		return &requeue{curError: err}
 	}
 
 	cluster.Status.ConnectionString = connectionString.String()

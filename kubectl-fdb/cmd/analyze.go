@@ -22,18 +22,19 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	kubeHelper "github.com/FoundationDB/fdb-kubernetes-operator/internal/kubernetes"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbstatus"
+	kubeHelper "github.com/FoundationDB/fdb-kubernetes-operator/v2/internal/kubernetes"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbstatus"
 
 	"k8s.io/client-go/rest"
 
 	"context"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
@@ -158,7 +159,7 @@ func newAnalyzeCmd(streams genericclioptions.IOStreams) *cobra.Command {
 					errMsg.WriteString(err.Error())
 				}
 
-				return fmt.Errorf(errMsg.String())
+				return errors.New(errMsg.String())
 			}
 
 			return nil
@@ -219,7 +220,7 @@ func allConditionsValid(conditions []string) error {
 		return nil
 	}
 
-	return fmt.Errorf(errString.String())
+	return errors.New(errString.String())
 }
 
 func analyzeCluster(cmd *cobra.Command, kubeClient client.Client, cluster *fdbv1beta2.FoundationDBCluster, autoFix bool, wait bool, ignoreConditions []string, ignoreRemovals bool) error {

@@ -197,6 +197,7 @@ FoundationDBClusterAutomationOptions provides flags for enabling or disabling op
 | useManagementAPI | UseManagementAPI defines if the operator should make use of the management API instead of using fdbcli to interact with the FoundationDB cluster. | *bool | false |
 | maintenanceModeOptions | MaintenanceModeOptions contains options for maintenance mode related settings. | [MaintenanceModeOptions](#maintenancemodeoptions) | false |
 | ignoreLogGroupsForUpgrade | IgnoreLogGroupsForUpgrade defines the list of LogGroups that should be ignored during fdb version upgrade. The default is a list that includes \"fdb-kubernetes-operator\". | [][LogGroup](#loggroup) | false |
+| synchronizationMode | SynchronizationMode defines the synchronization mode for clusters that are managed by multiple operator instances. The default is \"local\" which means all operator instances are only acting on their local processes, with the exception for cluster upgrades. In the \"global\" mode the operator instances coordinate actions to only issue a single exclude/bounce/include to reduce the disruptions. The global coordination mode is based on an optimistic mode and there are no guarantees that the action will only be executed once, e.g. because of a slow operator instance.  More details: https://github.com/FoundationDB/fdb-kubernetes-operator/blob/main/docs/design/better_coordination_multi_operator.md | *string | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -374,7 +375,7 @@ MaintenanceModeOptions controls options for placing zones in maintenance mode.
 | Field | Description | Scheme | Required |
 | ----- | ----------- | ------ | -------- |
 | UseMaintenanceModeChecker | UseMaintenanceModeChecker defines whether the operator is allowed to use maintenance mode before updating pods. If this setting is set to true the operator will set and reset the maintenance mode when updating pods. If this setting is set to true, then ResetMaintenanceMode will also be enabled to make sure the operator is able to reset the maintenance mode again. Default is false. | *bool | false |
-| resetMaintenanceMode | ResetMaintenanceMode defines whether the operator should reset the maintenance mode if all storage processes under the maintenance zone have been restarted. The default is false. For more details see: https://github.com/FoundationDB/fdb-kubernetes-operator/blob/improve-maintenance-mode-integration/docs/manual/operations.md#maintenance Default is false. | *bool | false |
+| resetMaintenanceMode | ResetMaintenanceMode defines whether the operator should reset the maintenance mode if all storage processes under the maintenance zone have been restarted. The default is false. For more details see: https://github.com/FoundationDB/fdb-kubernetes-operator/v2/blob/improve-maintenance-mode-integration/docs/manual/operations.md#maintenance Default is false. | *bool | false |
 | maintenanceModeTimeSeconds | MaintenanceModeTimeSeconds provides the duration for the zone to be in maintenance. It will automatically be switched off after the time elapses. Default is 600. | *int | false |
 
 [Back to TOC](#table-of-contents)
@@ -468,10 +469,16 @@ RoutingConfig allows configuring routing to our pods, and services that sit in f
 | ----- | ----------- | ------ | -------- |
 | headlessService | Headless determines whether we want to run a headless service for the cluster. | *bool | false |
 | publicIPSource | PublicIPSource specifies what source a process should use to get its public IPs.  This supports the values `pod` and `service`. | *[PublicIPSource](#publicipsource) | false |
-| podIPFamily | PodIPFamily tells the pod which family of IP addresses to use. You can use 4 to represent IPv4, and 6 to represent IPv6. This feature is only supported in FDB 7.0 or later, and requires dual-stack support in your Kubernetes environment. | *int | false |
+| podIPFamily | PodIPFamily tells the pod which family of IP addresses to use. You can use 4 to represent IPv4, and 6 to represent IPv6. This feature requires dual-stack support in your Kubernetes environment. | *int | false |
 | useDNSInClusterFile | UseDNSInClusterFile determines whether to use DNS names rather than IP addresses to identify coordinators in the cluster file. This requires FoundationDB 7.0+. | *bool | false |
 | defineDNSLocalityFields | DefineDNSLocalityFields determines whether to define pod DNS names on pod specs and provide them in the locality arguments to fdbserver.  This is ignored if UseDNSInCluster is true. | *bool | false |
 | dnsDomain | DNSDomain defines the cluster domain used in a DNS name generated for a service. The default is `cluster.local`. | *string | false |
+
+[Back to TOC](#table-of-contents)
+
+## SynchronizationMode
+
+SynchronizationMode defines the synchronization mode.
 
 [Back to TOC](#table-of-contents)
 
@@ -483,6 +490,12 @@ TaintReplacementOption defines the taint key and taint duration the operator wil
 | ----- | ----------- | ------ | -------- |
 | key | Tainted key | *string | false |
 | durationInSeconds | The tainted key must be present for DurationInSeconds before operator replaces pods on the node with this taint; DurationInSeconds cannot be a negative number. | *int64 | false |
+
+[Back to TOC](#table-of-contents)
+
+## UpdateAction
+
+UpdateAction defines the update action for an entry in the multi-region coordination key-space.
 
 [Back to TOC](#table-of-contents)
 

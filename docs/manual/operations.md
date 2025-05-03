@@ -10,14 +10,17 @@ The following localities will be set by the operator:
 - `--locality_machineid`: The value will be set depending on the fault domain key. For `foundationdb.org/none`, this will be the Pod's name, for all other cases this will be the node name on which the pod is running.
 - `--locality_zoneid`: The value will be set depending on the fault domain key. For `foundationdb.org/none`, this will be the Pod's name, otherwise this will be the node name per default where the Pod is running. If `ValueFrom` is defined in the fault domain this value will be used. If `foundationdb.org/kubernetes-cluster` is specified as fault domain key the predefined `value` will be used.
 - `--locality_dcid`: This value will be set to the value defined in `cluster.Spec.DataCenter`, if this value is not set the locality will not be set. This locality is used for FoundationDB deployments in multiple datacenters/Kubernetes clusters.
-- `--locality_data_hall`: This value will be set to the value defined in `cluster.Spec.DataHall`, if this value is not set the locality will not be set. Currently this locality doesn't have any affect, but will be used in the future for `three_data_hall` replication.
+- `--locality_data_hall`: This value will be set to the value defined in `cluster.Spec.DataHall`, if this value is not set the locality will not be set. It is used for `three_data_hall` replication.
 - `--locality_dns_name`: This value will only be set if `cluster.Spec.Routing.DefineDNSLocalityFields` is set to true. The value will be set to the `FDB_DNS_NAME` environment variable, which is set by the operator.
 
 The operator uses the `locality_instance_id` to identify the process from the [machine-readable status](https://apple.github.io/foundationdb/mr-status.html) and match it to the according process group managed by the operator.
 
 ## Replacing a Process
 
-If you delete a pod, the operator will automatically create a new pod to replace it. If there is a volume available for re-use, we will create a new pod to match that volume. This means that in general you can replace a bad process just by deleting the pod. This may not be desirable in all situations, as it creates a loss of fault tolerance until the replacement pod is created. This also requires that the original volume be available, which may not be possible in some failure scenarios.
+If you delete a pod, the operator will automatically create a new pod to replace it. If there is a volume available for re-use, we will create a new pod to match that volume.
+This means that in general you can replace a bad process just by deleting the pod.
+This may not be desirable in all situations, as it creates a loss of fault tolerance until the replacement pod is created.
+This also requires that the original volume be available, which may not be possible in some failure scenarios.
 
 As an alternative, you can replace a pod by explicitly placing it in the `processGroupsToRemove` list:
 
@@ -98,13 +101,13 @@ spec:
 ```
 
 The default value for the log group of the operator is `fdb-kubernetes-operator` but can be changed by setting the environment variable `FDB_NETWORK_OPTION_TRACE_LOG_GROUP`.
-The operator version `v1.19.0` and never sets this value as a default and those changes are not required.
+The operator version `v1.19.0` and newer sets this value as a default and those changes are not required.
 
 The upgrade process is described in more detail in [upgrades](./upgrades.md).
 
 ## Renaming a Cluster
 
-The name of a cluster is immutable, and it is included in the names of all of the dependent resources, as well as in labels on the resources.
+The name of a cluster is immutable, and it is included in the names of all the dependent resources, as well as in labels on the resources.
 If you want to change the name later on, you can do so with the following steps.
 This example assumes you are renaming the cluster `sample-cluster` to `sample-cluster-2`.
 
@@ -176,6 +179,10 @@ All processes that have finished the maintenance and the stale entries will be r
 Processes that have not yet finished their maintenance will stay untouched.
 If a maintenance zone is active and some processes have not yet finished the operator will requeue a reconciliation and wait until all processes are done.
 If all processes have finished their maintenance and a maintenance zone is active the operator will reset the maintenance zone.
+
+Before the operator performs the reset of the maintenance zone it will check the [QoS](https://apple.github.io/foundationdb/administration.html#machine-readable-status) metrics of the machine-readable status.
+It will wait until no storage server is lagging behind more than 60 seconds and it will ensure that the queued bytes for log and storage servers are not exceeding 250MB.
+For more details check the `CheckQosStatus` method in the [fdbstatus package](https://github.com/FoundationDB/fdb-kubernetes-operator/tree/main/pkg/fdbstatus)
 
 ### External integration
 

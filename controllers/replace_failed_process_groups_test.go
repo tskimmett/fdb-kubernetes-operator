@@ -22,15 +22,14 @@ package controllers
 
 import (
 	ctx "context"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"time"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbadminclient/mock"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbadminclient/mock"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/pointer"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
-
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -408,6 +407,7 @@ var _ = Describe("replace_failed_process_groups", func() {
 				Context("with no addresses", func() {
 					BeforeEach(func() {
 						processGroup.Addresses = nil
+						cluster.Spec.AutomationOptions.UseLocalitiesForExclusion = pointer.Bool(false)
 					})
 
 					It("should requeue", func() {
@@ -899,6 +899,7 @@ var _ = Describe("replace_failed_process_groups", func() {
 					When("the cluster doesn't have full fault tolerance", func() {
 						BeforeEach(func() {
 							processGroup.Addresses = nil
+							cluster.Spec.AutomationOptions.UseLocalitiesForExclusion = pointer.Bool(false)
 
 							adminClient, err := mock.NewMockAdminClientUncast(cluster, k8sClient)
 							Expect(err).NotTo(HaveOccurred())

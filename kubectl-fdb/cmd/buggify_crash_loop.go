@@ -24,7 +24,7 @@ import (
 	ctx "context"
 	"fmt"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	"github.com/spf13/cobra"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -43,7 +43,7 @@ func newBuggifyCrashLoop(streams genericclioptions.IOStreams) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			clear, err := cmd.Flags().GetBool("clear")
+			clearFlag, err := cmd.Flags().GetBool("clear")
 			if err != nil {
 				return err
 			}
@@ -70,7 +70,7 @@ func newBuggifyCrashLoop(streams genericclioptions.IOStreams) *cobra.Command {
 				buggifyProcessGroupOptions{
 					containerName: containerName,
 					wait:          wait,
-					clear:         clear,
+					clear:         clearFlag,
 					clean:         clean,
 				},
 				processGroupSelectionOpts,

@@ -25,16 +25,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal/buggify"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal/buggify"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbadminclient/mock"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbadminclient/mock"
 	"k8s.io/utils/pointer"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 )
 
 var _ = Describe("bounceProcesses", func() {
@@ -60,7 +60,7 @@ var _ = Describe("bounceProcesses", func() {
 			requeue = bounceProcesses{}.reconcile(context.TODO(), clusterReconciler, cluster, nil, globalControllerLogger)
 		})
 
-		Context("with a reconciled cluster", func() {
+		When("the cluster is reconciled", func() {
 			It("should not requeue", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(requeue).To(BeNil())
@@ -698,6 +698,8 @@ var _ = Describe("bounceProcesses", func() {
 		When("when there are unreachable processes", func() {
 			When("the unreachable processes include at least one tester process", func() {
 				BeforeEach(func() {
+					cluster.Spec.Version = "7.1.0"
+					cluster.Status.RunningVersion = cluster.Spec.Version
 					adminClient, err = mock.NewMockAdminClientUncast(cluster, k8sClient)
 					Expect(err).NotTo(HaveOccurred())
 
@@ -893,6 +895,98 @@ var _ = Describe("bounceProcesses", func() {
 
 				It("should not kill the cluster controller", func() {
 					Expect(adminClient.KilledAddresses).To(BeEmpty())
+				})
+			})
+		})
+
+		When("using the global synchronization mode", func() {
+			BeforeEach(func() {
+				cluster.Spec.AutomationOptions.SynchronizationMode = pointer.String(string(fdbv1beta2.SynchronizationModeGlobal))
+				adminClient.MockAdditionTimeForGlobalCoordination = time.Now().Add(-1 * time.Minute)
+			})
+
+			When("the cluster is reconciled", func() {
+				It("should not kill any processes", func() {
+					Expect(err).NotTo(HaveOccurred())
+					Expect(requeue).To(BeNil())
+					Expect(adminClient.KilledAddresses).To(BeEmpty())
+				})
+			})
+
+			When("one process needs a restart", func() {
+				var pickedProcessGroup *fdbv1beta2.ProcessGroupStatus
+
+				BeforeEach(func() {
+					pickedProcessGroups := internal.PickProcessGroups(cluster, fdbv1beta2.ProcessClassStorage, 1)
+					Expect(pickedProcessGroups).To(HaveLen(1))
+					pickedProcessGroup = pickedProcessGroups[0]
+					pickedProcessGroup.UpdateCondition(fdbv1beta2.IncorrectCommandLine, true)
+				})
+
+				When("the process is not part of the pending to restart set", func() {
+					When("the restart of the process is possible", func() {
+						It("should kill the process", func() {
+							Expect(requeue).To(BeNil())
+							Expect(adminClient.KilledAddresses).To(HaveLen(1))
+							for _, address := range pickedProcessGroup.Addresses {
+								Expect(adminClient.KilledAddresses).To(HaveKey(fmt.Sprintf("%s:4501", address)))
+							}
+
+							pendingForRestart, err := adminClient.GetPendingForRestart("")
+							Expect(err).NotTo(HaveOccurred())
+							Expect(pendingForRestart).To(HaveLen(1))
+							Expect(pendingForRestart).To(HaveKey(pickedProcessGroup.ProcessGroupID))
+
+							readyForRestart, err := adminClient.GetReadyForRestart("")
+							Expect(err).NotTo(HaveOccurred())
+							Expect(readyForRestart).To(BeEmpty())
+						})
+					})
+
+					When("the restart of the process is not possible", func() {
+						BeforeEach(func() {
+							cluster.Spec.MinimumUptimeSecondsForBounce = 60002
+						})
+
+						AfterEach(func() {
+							clusterReconciler.MinimumRequiredUptimeCCBounce = 0
+						})
+
+						It("should not kill the cluster controller", func() {
+							Expect(requeue).NotTo(BeNil())
+							Expect(adminClient.KilledAddresses).To(BeEmpty())
+
+							pendingForRestart, err := adminClient.GetPendingForRestart("")
+							Expect(err).NotTo(HaveOccurred())
+							Expect(pendingForRestart).To(HaveLen(1))
+							Expect(pendingForRestart).To(HaveKey(pickedProcessGroup.ProcessGroupID))
+						})
+					})
+				})
+
+				When("the process is part of the pending to restart set", func() {
+					BeforeEach(func() {
+						Expect(adminClient.UpdatePendingForRestart(map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction{
+							pickedProcessGroup.ProcessGroupID: fdbv1beta2.UpdateActionAdd,
+						})).To(Succeed())
+					})
+
+					It("should kill the process", func() {
+						Expect(requeue).To(BeNil())
+						Expect(adminClient.KilledAddresses).To(HaveLen(1))
+						for _, address := range pickedProcessGroup.Addresses {
+							Expect(adminClient.KilledAddresses).To(HaveKey(fmt.Sprintf("%s:4501", address)))
+						}
+
+						pendingForRestart, err := adminClient.GetPendingForRestart("")
+						Expect(err).NotTo(HaveOccurred())
+						Expect(pendingForRestart).To(HaveLen(1))
+						Expect(pendingForRestart).To(HaveKey(pickedProcessGroup.ProcessGroupID))
+
+						readyForRestart, err := adminClient.GetReadyForRestart("")
+						Expect(err).NotTo(HaveOccurred())
+						Expect(readyForRestart).To(BeEmpty())
+					})
 				})
 			})
 		})

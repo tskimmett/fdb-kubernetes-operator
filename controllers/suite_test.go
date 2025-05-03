@@ -22,23 +22,23 @@ package controllers
 
 import (
 	"context"
-	"github.com/go-logr/logr"
 	"testing"
 	"time"
 
-	mockpodclient "github.com/FoundationDB/fdb-kubernetes-operator/pkg/podclient/mock"
+	mockpodclient "github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/podclient/mock"
+	"github.com/go-logr/logr"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbadminclient/mock"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbadminclient/mock"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/podmanager"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/podmanager"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	mockclient "github.com/FoundationDB/fdb-kubernetes-operator/mock-kubernetes-client/client"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	mockclient "github.com/FoundationDB/fdb-kubernetes-operator/v2/mock-kubernetes-client/client"
 
 	"github.com/onsi/gomega/gexec"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -187,7 +187,7 @@ func createTestClusterReconciler() *FoundationDBClusterReconciler {
 		Log:                          ctrl.Log.WithName("controllers").WithName("FoundationDBCluster"),
 		Recorder:                     k8sClient,
 		InSimulation:                 true,
-		PodLifecycleManager:          podmanager.StandardPodLifecycleManager{},
+		PodLifecycleManager:          &podmanager.StandardPodLifecycleManager{},
 		PodClientProvider:            mockpodclient.NewMockFdbPodClient,
 		DatabaseClientProvider:       mock.DatabaseClientProvider{},
 		MaintenanceListStaleDuration: 4 * time.Hour,

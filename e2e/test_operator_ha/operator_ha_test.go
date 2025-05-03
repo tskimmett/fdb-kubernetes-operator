@@ -30,15 +30,16 @@ This cluster will be used for all tests.
 */
 
 import (
+	"context"
 	"log"
 	"strconv"
 	"time"
 
 	"k8s.io/utils/pointer"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/e2e/fixtures"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbstatus"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/e2e/fixtures"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbstatus"
 	chaosmesh "github.com/chaos-mesh/chaos-mesh/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -125,13 +126,31 @@ var _ = Describe("Operator HA tests", Label("e2e", "pr"), func() {
 				}
 
 				log.Println("deleting coordinator pod:", pod.Name, "with addresses", pod.Status.PodIPs)
+				// Set Pod as unschedulable to ensure that they are not recreated. Otherwise the Pods might be recreated
+				// fast enough to not result in a new connection string.
+				fdbCluster.GetPrimary().SetPodAsUnschedulable(pod)
 				factory.DeletePod(&pod)
 			}
 		})
 
+		AfterEach(func() {
+			Expect(fdbCluster.GetPrimary().ClearBuggifyNoSchedule(true)).To(Succeed())
+		})
+
 		It("should change the coordinators", func() {
 			primary := fdbCluster.GetPrimary()
+
+			lastForceReconcile := time.Now()
 			Eventually(func(g Gomega) string {
+				// Ensure that the coordinators are changed in a timely manner for the test case.
+				if time.Since(lastForceReconcile) > 1*time.Minute {
+					for _, cluster := range fdbCluster.GetAllClusters() {
+						cluster.ForceReconcile()
+					}
+
+					lastForceReconcile = time.Now()
+				}
+
 				status := primary.GetStatus()
 
 				// Make sure we have the same count of coordinators again and the deleted
@@ -139,7 +158,7 @@ var _ = Describe("Operator HA tests", Label("e2e", "pr"), func() {
 				g.Expect(coordinators).To(HaveLen(len(initialCoordinators)))
 
 				return status.Cluster.ConnectionString
-			}).WithTimeout(5 * time.Minute).WithPolling(2 * time.Second).ShouldNot(Equal(initialConnectionString))
+			}).WithTimeout(10 * time.Minute).WithPolling(2 * time.Second).ShouldNot(Equal(initialConnectionString))
 
 			// Make sure the new connection string is propagated in time to all FoundationDBCLuster resources.
 			for _, cluster := range fdbCluster.GetAllClusters() {
@@ -197,6 +216,8 @@ var _ = Describe("Operator HA tests", Label("e2e", "pr"), func() {
 
 		It("should not replace too many Pods and bring down the satellite", func() {
 			satellite := fdbCluster.GetPrimarySatellite()
+			primary := fdbCluster.GetPrimary()
+			primaryDCID := primary.GetCluster().Spec.DataCenter
 
 			Consistently(func() int {
 				var runningPods int
@@ -208,9 +229,28 @@ var _ = Describe("Operator HA tests", Label("e2e", "pr"), func() {
 					runningPods++
 				}
 
-				// We should add here another check that the cluster stays in the primary.
+				Expect(fdbCluster.GetPrimary().GetStatus().Cluster.DatabaseConfiguration.GetPrimaryDCID()).To(Equal(primaryDCID))
+
 				return runningPods
-			}).WithTimeout(10 * time.Minute).WithPolling(2 * time.Second).Should(BeNumerically(">=", desiredRunningPods))
+			}).WithTimeout(5 * time.Minute).WithPolling(2 * time.Second).Should(BeNumerically(">=", desiredRunningPods))
+
+			// Add enough quota, so that the log processes can be updated after some time.
+			processCounts, err := fdbCluster.GetPrimarySatellite().GetCluster().GetProcessCountsWithDefaults()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(factory.GetControllerRuntimeClient().Update(context.Background(), &corev1.ResourceQuota{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "testing-quota",
+					Namespace: satellite.Namespace(),
+				},
+				Spec: corev1.ResourceQuotaSpec{
+					Hard: corev1.ResourceList{
+						corev1.ResourcePersistentVolumeClaims: resource.MustParse(strconv.Itoa(processCounts.Log)),
+					},
+				},
+			})).To(Succeed())
+
+			// Wait until the cluster has replaced all the log processes.
+			Expect(fdbCluster.WaitForReconciliation()).NotTo(HaveOccurred())
 		})
 	})
 
@@ -280,6 +320,114 @@ var _ = Describe("Operator HA tests", Label("e2e", "pr"), func() {
 						GenericSelectorSpec: chaosmesh.GenericSelectorSpec{
 							Namespaces:     []string{fdbCluster.GetRemote().Namespace()},
 							LabelSelectors: fdbCluster.GetRemote().GetCachedCluster().GetMatchLabels(),
+						},
+					}, chaosmesh.Both,
+					&chaosmesh.DelaySpec{
+						Latency:     "250ms",
+						Correlation: "100",
+						Jitter:      "0",
+					})
+
+				// TODO (johscheuer): Allow to have this as a long running task until the test is done.
+				factory.CreateDataLoaderIfAbsentWithWait(fdbCluster.GetPrimary(), false)
+
+				time.Sleep(1 * time.Minute)
+				log.Println("replacedPod", replacedPod.Name, "useLocalitiesForExclusion", fdbCluster.GetPrimary().GetCluster().UseLocalitiesForExclusion())
+				fdbCluster.GetRemote().ReplacePod(replacedPod, true)
+			})
+
+			It("should exclude and remove the pod", func() {
+				Eventually(func() []fdbv1beta2.ExcludedServers {
+					status := fdbCluster.GetPrimary().GetStatus()
+					excludedServers := status.Cluster.DatabaseConfiguration.ExcludedServers
+					log.Println("excludedServers", excludedServers)
+					return excludedServers
+				}).WithTimeout(15 * time.Minute).WithPolling(1 * time.Second).Should(BeEmpty())
+			})
+
+			AfterEach(func() {
+				Expect(fdbCluster.GetRemote().ClearProcessGroupsToRemove()).NotTo(HaveOccurred())
+				factory.DeleteChaosMeshExperimentSafe(experiment)
+				// Making sure we included back all the process groups after exclusion is complete.
+				Expect(fdbCluster.GetPrimary().GetStatus().Cluster.DatabaseConfiguration.ExcludedServers).To(BeEmpty())
+				factory.DeleteDataLoader(fdbCluster.GetPrimary())
+			})
+		})
+
+		PWhen("when a remote side has network latency issues and a pod gets replaced", func() {
+			/*
+
+				*Note* This test should be running with a bigger multi-region cluster e.g.:
+
+					config := fixtures.DefaultClusterConfigWithHaMode(fixtures.HaFourZoneSingleSat, false)
+					config.StorageServerPerPod = 8
+					config.MachineCount = 10
+					config.DisksPerMachine = 8
+
+			*/
+			var experiment *fixtures.ChaosMeshExperiment
+
+			BeforeEach(func() {
+				dcID := fdbCluster.GetRemote().GetCluster().Spec.DataCenter
+
+				status := fdbCluster.GetPrimary().GetStatus()
+
+				var processGroupID fdbv1beta2.ProcessGroupID
+				for _, process := range status.Cluster.Processes {
+					dc, ok := process.Locality[fdbv1beta2.FDBLocalityDCIDKey]
+					if !ok || dc != dcID {
+						continue
+					}
+
+					var isLog bool
+					for _, role := range process.Roles {
+						if role.Role == "log" {
+							isLog = true
+							break
+						}
+					}
+
+					if !isLog {
+						continue
+					}
+
+					processGroupID = fdbv1beta2.ProcessGroupID(process.Locality[fdbv1beta2.FDBLocalityInstanceIDKey])
+					break
+				}
+
+				log.Println("Will inject chaos into", processGroupID, "and replace it")
+				var replacedPod corev1.Pod
+				for _, pod := range fdbCluster.GetRemote().GetLogPods().Items {
+					if fixtures.GetProcessGroupID(pod) != processGroupID {
+						continue
+					}
+
+					replacedPod = pod
+					break
+				}
+
+				log.Println("Inject latency chaos")
+				experiment = factory.InjectNetworkLatency(
+					chaosmesh.PodSelectorSpec{
+						GenericSelectorSpec: chaosmesh.GenericSelectorSpec{
+							Namespaces:     []string{fdbCluster.GetRemote().Namespace()},
+							LabelSelectors: fdbCluster.GetRemote().GetCachedCluster().GetMatchLabels(),
+						},
+					},
+					chaosmesh.PodSelectorSpec{
+						GenericSelectorSpec: chaosmesh.GenericSelectorSpec{
+							Namespaces: []string{
+								fdbCluster.GetPrimary().Namespace(),
+								fdbCluster.GetPrimarySatellite().Namespace(),
+								fdbCluster.GetRemote().Namespace(),
+								fdbCluster.GetRemoteSatellite().Namespace(),
+							},
+							ExpressionSelectors: []metav1.LabelSelectorRequirement{
+								{
+									Key:      fdbv1beta2.FDBClusterLabel,
+									Operator: metav1.LabelSelectorOpExists,
+								},
+							},
 						},
 					}, chaosmesh.Both,
 					&chaosmesh.DelaySpec{

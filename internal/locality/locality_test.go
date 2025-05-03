@@ -22,12 +22,6 @@ package locality
 
 import (
 	"fmt"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/podclient/mock"
-	"github.com/go-logr/logr"
-	"github.com/onsi/gomega/gmeasure"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
 	"math"
 	"math/rand"
 	"net"
@@ -35,8 +29,15 @@ import (
 	"strings"
 	"time"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/podclient/mock"
+	"github.com/go-logr/logr"
+	"github.com/onsi/gomega/gmeasure"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/pointer"
+
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -1549,11 +1550,6 @@ var _ = Describe("Localities", func() {
 		})
 
 		When("enabling DNS names in the cluster file", func() {
-			BeforeEach(func() {
-				cluster.Spec.Routing.UseDNSInClusterFile = pointer.Bool(true)
-				cluster.Status.RunningVersion = fdbv1beta2.Versions.SupportsDNSInClusterFile.String()
-			})
-
 			When("the pods do not have DNS names assigned", func() {
 				It("should report valid coordinators", func() {
 					coordinatorsValid, addressesValid, err := CheckCoordinatorValidity(logr.Discard(), cluster, status, coordinatorStatus)

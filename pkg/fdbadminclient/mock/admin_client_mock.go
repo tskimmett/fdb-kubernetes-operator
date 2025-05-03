@@ -23,20 +23,21 @@ package mock
 import (
 	"context"
 	"fmt"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbstatus"
-	"k8s.io/utils/pointer"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/podclient/mock"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbstatus"
+	"k8s.io/utils/pointer"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbadminclient"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/podclient/mock"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/podmanager"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbadminclient"
+
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/podmanager"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -52,6 +53,13 @@ type AdminClient struct {
 	missingLocalities                        map[fdbv1beta2.ProcessGroupID]fdbv1beta2.None
 	missingProcessGroups                     map[fdbv1beta2.ProcessGroupID]fdbv1beta2.None
 	incorrectCommandLines                    map[fdbv1beta2.ProcessGroupID]fdbv1beta2.None
+	pendingForRemoval                        map[fdbv1beta2.ProcessGroupID]time.Time
+	pendingForExclusion                      map[fdbv1beta2.ProcessGroupID]time.Time
+	pendingForInclusion                      map[fdbv1beta2.ProcessGroupID]time.Time
+	pendingForRestart                        map[fdbv1beta2.ProcessGroupID]time.Time
+	readyForExclusion                        map[fdbv1beta2.ProcessGroupID]time.Time
+	readyForInclusion                        map[fdbv1beta2.ProcessGroupID]time.Time
+	readyForRestart                          map[fdbv1beta2.ProcessGroupID]time.Time
 	FrozenStatus                             *fdbv1beta2.FoundationDBStatus
 	Backups                                  map[string]fdbv1beta2.FoundationDBBackupStatusBackupDetails
 	clientVersions                           map[string][]string
@@ -65,6 +73,7 @@ type AdminClient struct {
 	MaintenanceZone                          fdbv1beta2.FaultDomain
 	restoreURL                               string
 	maintenanceZoneStartTimestamp            time.Time
+	MockAdditionTimeForGlobalCoordination    time.Time
 	uptimeSecondsForMaintenanceZone          float64
 	TeamTracker                              []fdbv1beta2.FoundationDBStatusTeamTracker
 	Logs                                     []fdbv1beta2.FoundationDBStatusLogInfo
@@ -72,6 +81,8 @@ type AdminClient struct {
 	LagInfo                                  map[string]fdbv1beta2.FoundationDBStatusLagInfo
 	processesUnderMaintenance                map[fdbv1beta2.ProcessGroupID]int64
 }
+
+var _ fdbadminclient.AdminClient = (*AdminClient)(nil)
 
 // adminClientCache provides a cache of mock admin clients.
 var adminClientCache = make(map[string]*AdminClient)
@@ -101,6 +112,13 @@ func NewMockAdminClientUncast(cluster *fdbv1beta2.FoundationDBCluster, kubeClien
 			missingProcessGroups:      make(map[fdbv1beta2.ProcessGroupID]fdbv1beta2.None),
 			missingLocalities:         make(map[fdbv1beta2.ProcessGroupID]fdbv1beta2.None),
 			incorrectCommandLines:     make(map[fdbv1beta2.ProcessGroupID]fdbv1beta2.None),
+			pendingForRemoval:         make(map[fdbv1beta2.ProcessGroupID]time.Time),
+			pendingForExclusion:       make(map[fdbv1beta2.ProcessGroupID]time.Time),
+			pendingForInclusion:       make(map[fdbv1beta2.ProcessGroupID]time.Time),
+			pendingForRestart:         make(map[fdbv1beta2.ProcessGroupID]time.Time),
+			readyForExclusion:         make(map[fdbv1beta2.ProcessGroupID]time.Time),
+			readyForInclusion:         make(map[fdbv1beta2.ProcessGroupID]time.Time),
+			readyForRestart:           make(map[fdbv1beta2.ProcessGroupID]time.Time),
 			localityInfo:              make(map[fdbv1beta2.ProcessGroupID]map[string]string),
 			currentCommandLines:       make(map[string]string),
 			Knobs:                     make(map[string]fdbv1beta2.None),
@@ -189,9 +207,7 @@ func (client *AdminClient) GetStatus() (*fdbv1beta2.FoundationDBStatus, error) {
 			var fdbRoles []fdbv1beta2.FoundationDBStatusProcessRoleInfo
 
 			fullAddress := client.Cluster.GetFullAddress(processIP, processIndex)
-			_, ipExcluded := client.ExcludedAddresses[processIP]
-			_, addressExcluded := client.ExcludedAddresses[fullAddress.String()]
-			excluded := ipExcluded || addressExcluded
+			excluded := client.processIsExcluded(fullAddress, processGroupID)
 
 			pClass, err := podmanager.GetProcessClass(client.Cluster, &pod)
 			if err != nil {
@@ -392,37 +408,34 @@ func (client *AdminClient) GetStatus() (*fdbv1beta2.FoundationDBStatus, error) {
 		status.Cluster.DatabaseConfiguration.VersionFlags.LogSpill = 2
 	}
 
-	if len(client.ExcludedAddresses) > 0 {
-		status.Cluster.DatabaseConfiguration.ExcludedServers = make([]fdbv1beta2.ExcludedServers, 0, len(client.ExcludedAddresses))
-	}
-	for excludedAddresses := range client.ExcludedAddresses {
-		if net.ParseIP(excludedAddresses) != nil {
-			status.Cluster.DatabaseConfiguration.ExcludedServers = append(status.Cluster.DatabaseConfiguration.ExcludedServers, fdbv1beta2.ExcludedServers{Address: excludedAddresses})
-		} else {
-			status.Cluster.DatabaseConfiguration.ExcludedServers = append(status.Cluster.DatabaseConfiguration.ExcludedServers, fdbv1beta2.ExcludedServers{Locality: excludedAddresses})
+	exclusions := client.getExcludedAddresses()
+	// If no exclusions are present the status.Cluster.DatabaseConfiguration.ExcludedServers should be nil and not an
+	// empty slice.
+	if len(exclusions) > 0 {
+		status.Cluster.DatabaseConfiguration.ExcludedServers = make([]fdbv1beta2.ExcludedServers, 0, len(exclusions))
+		for _, exclusion := range exclusions {
+			if exclusion.IPAddress == nil {
+				status.Cluster.DatabaseConfiguration.ExcludedServers = append(status.Cluster.DatabaseConfiguration.ExcludedServers, fdbv1beta2.ExcludedServers{Locality: exclusion.MachineAddress()})
+				continue
+			}
+
+			status.Cluster.DatabaseConfiguration.ExcludedServers = append(status.Cluster.DatabaseConfiguration.ExcludedServers, fdbv1beta2.ExcludedServers{Address: exclusion.MachineAddress()})
 		}
 	}
 
 	if client.Cluster.Status.RunningVersion != "" {
-		parsedVersion, err := fdbv1beta2.ParseFdbVersion(client.Cluster.Status.RunningVersion)
-		if err != nil {
-			return nil, err
+		if status.Cluster.DatabaseConfiguration.StorageMigrationType == nil {
+			wiggleTypeDisabled := fdbv1beta2.StorageMigrationTypeDisabled
+			status.Cluster.DatabaseConfiguration.StorageMigrationType = &wiggleTypeDisabled
 		}
 
-		if parsedVersion.SupportsStorageMigrationConfiguration() {
-			if status.Cluster.DatabaseConfiguration.StorageMigrationType == nil {
-				wiggleTypeDisabled := fdbv1beta2.StorageMigrationTypeDisabled
-				status.Cluster.DatabaseConfiguration.StorageMigrationType = &wiggleTypeDisabled
-			}
+		if status.Cluster.DatabaseConfiguration.PerpetualStorageWiggleEngine == nil {
+			storageEngineNone := fdbv1beta2.StorageEngineNone
+			status.Cluster.DatabaseConfiguration.PerpetualStorageWiggleEngine = &storageEngineNone
+		}
 
-			if status.Cluster.DatabaseConfiguration.PerpetualStorageWiggleEngine == nil {
-				storageEngineNone := fdbv1beta2.StorageEngineNone
-				status.Cluster.DatabaseConfiguration.PerpetualStorageWiggleEngine = &storageEngineNone
-			}
-
-			if status.Cluster.DatabaseConfiguration.PerpetualStorageWiggleLocality == nil {
-				status.Cluster.DatabaseConfiguration.PerpetualStorageWiggleLocality = pointer.String("0")
-			}
+		if status.Cluster.DatabaseConfiguration.PerpetualStorageWiggleLocality == nil {
+			status.Cluster.DatabaseConfiguration.PerpetualStorageWiggleLocality = pointer.String("0")
 		}
 	}
 
@@ -480,8 +493,8 @@ func (client *AdminClient) GetStatus() (*fdbv1beta2.FoundationDBStatus, error) {
 		for tag, tagStatus := range client.Backups {
 			status.Cluster.Layers.Backup.Tags[tag] = fdbv1beta2.FoundationDBStatusBackupTag{
 				CurrentContainer: tagStatus.URL,
-				RunningBackup:    tagStatus.Running,
-				Restorable:       true,
+				RunningBackup:    &tagStatus.Running,
+				Restorable:       pointer.Bool(true),
 			}
 			status.Cluster.Layers.Backup.Paused = tagStatus.Paused
 		}
@@ -525,8 +538,34 @@ func (client *AdminClient) GetStatus() (*fdbv1beta2.FoundationDBStatus, error) {
 	return status, nil
 }
 
+// processIsExcluded checks if the process is excluded by IP, IP:Port or by locality (so far the locality only matches for
+// the instance_id, as the operator makes use of that one.
+func (client *AdminClient) processIsExcluded(fullAddress fdbv1beta2.ProcessAddress, processGroupID fdbv1beta2.ProcessGroupID) bool {
+	if len(client.ExcludedAddresses) == 0 {
+		return false
+	}
+
+	_, ipExcluded := client.ExcludedAddresses[fullAddress.IPAddress.String()]
+	if ipExcluded {
+		return true
+	}
+	_, addressExcluded := client.ExcludedAddresses[fullAddress.String()]
+	if addressExcluded {
+		return true
+	}
+
+	if client.Cluster.UseLocalitiesForExclusion() {
+		localityExclusionString := fmt.Sprintf("%s:%s", fdbv1beta2.FDBLocalityExclusionPrefix, processGroupID)
+		if _, isExcluded := client.ExcludedAddresses[localityExclusionString]; isExcluded {
+			return true
+		}
+	}
+
+	return false
+}
+
 // ConfigureDatabase changes the database configuration
-func (client *AdminClient) ConfigureDatabase(configuration fdbv1beta2.DatabaseConfiguration, _ bool, version string) error {
+func (client *AdminClient) ConfigureDatabase(configuration fdbv1beta2.DatabaseConfiguration, _ bool) error {
 	adminClientMutex.Lock()
 	defer adminClientMutex.Unlock()
 
@@ -535,31 +574,18 @@ func (client *AdminClient) ConfigureDatabase(configuration fdbv1beta2.DatabaseCo
 	}
 
 	client.DatabaseConfiguration = configuration.DeepCopy()
-
-	ver, err := fdbv1beta2.ParseFdbVersion(version)
-	if err != nil {
-		return err
+	if configuration.StorageMigrationType == nil {
+		migrationType := fdbv1beta2.StorageMigrationTypeDisabled
+		client.DatabaseConfiguration.StorageMigrationType = &migrationType
 	}
 
-	if !ver.HasSeparatedProxies() {
-		client.DatabaseConfiguration.GrvProxies = 0
-		client.DatabaseConfiguration.CommitProxies = 0
+	if configuration.PerpetualStorageWiggleEngine == nil {
+		storageEngineNone := fdbv1beta2.StorageEngineNone
+		client.DatabaseConfiguration.PerpetualStorageWiggleEngine = &storageEngineNone
 	}
 
-	if ver.SupportsStorageMigrationConfiguration() {
-		if configuration.StorageMigrationType == nil {
-			migrationType := fdbv1beta2.StorageMigrationTypeDisabled
-			client.DatabaseConfiguration.StorageMigrationType = &migrationType
-		}
-
-		if configuration.PerpetualStorageWiggleEngine == nil {
-			storageEngineNone := fdbv1beta2.StorageEngineNone
-			client.DatabaseConfiguration.PerpetualStorageWiggleEngine = &storageEngineNone
-		}
-
-		if configuration.PerpetualStorageWiggleLocality == nil {
-			client.DatabaseConfiguration.PerpetualStorageWiggleLocality = pointer.String("0")
-		}
+	if configuration.PerpetualStorageWiggleLocality == nil {
+		client.DatabaseConfiguration.PerpetualStorageWiggleLocality = pointer.String("0")
 	}
 
 	return nil
@@ -652,8 +678,31 @@ func (client *AdminClient) CanSafelyRemove(addresses []fdbv1beta2.ProcessAddress
 	return remaining, nil
 }
 
-// GetExclusions gets a list of the addresses currently excluded from the
-// database.
+// getExcludedAddresses will return the excluded addresses based on the client.ExcludedAddresses.
+func (client *AdminClient) getExcludedAddresses() []fdbv1beta2.ProcessAddress {
+	if len(client.ExcludedAddresses) == 0 {
+		return []fdbv1beta2.ProcessAddress{}
+	}
+
+	excludedAddresses := make([]fdbv1beta2.ProcessAddress, 0, len(client.ExcludedAddresses))
+	for addr := range client.ExcludedAddresses {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			excludedAddresses = append(excludedAddresses, fdbv1beta2.ProcessAddress{StringAddress: addr})
+			continue
+		}
+
+		excludedAddresses = append(excludedAddresses, fdbv1beta2.ProcessAddress{
+			IPAddress: net.ParseIP(addr),
+			Port:      0,
+			Flags:     nil,
+		})
+	}
+
+	return excludedAddresses
+}
+
+// GetExclusions gets a list of the addresses currently excluded from the database.
 func (client *AdminClient) GetExclusions() ([]fdbv1beta2.ProcessAddress, error) {
 	adminClientMutex.Lock()
 	defer adminClientMutex.Unlock()
@@ -662,20 +711,7 @@ func (client *AdminClient) GetExclusions() ([]fdbv1beta2.ProcessAddress, error) 
 		return nil, client.mockError
 	}
 
-	pAddrs := make([]fdbv1beta2.ProcessAddress, 0, len(client.ExcludedAddresses))
-	for addr := range client.ExcludedAddresses {
-		ip := net.ParseIP(addr)
-		if ip == nil {
-			pAddrs = append(pAddrs, fdbv1beta2.ProcessAddress{StringAddress: addr})
-		} else {
-			pAddrs = append(pAddrs, fdbv1beta2.ProcessAddress{
-				IPAddress: net.ParseIP(addr),
-				Port:      0,
-				Flags:     nil,
-			})
-		}
-	}
-	return pAddrs, nil
+	return client.getExcludedAddresses(), nil
 }
 
 // KillProcesses restarts processes
@@ -687,6 +723,11 @@ func (client *AdminClient) KillProcesses(addresses []fdbv1beta2.ProcessAddress) 
 	}
 
 	for _, addr := range addresses {
+		// Set the StringAddress to an empty string, to ensure the IP address will be picked. The kill command doesn't
+		// support localities right now.
+		if addr.IPAddress != nil {
+			addr.StringAddress = ""
+		}
 		client.KilledAddresses[addr.String()] = fdbv1beta2.None{}
 		// Remove the commandline from the cached status and let it be recomputed in the next GetStatus request.
 		// This reflects that the commandline will only be updated if the processes are actually be restarted.
@@ -905,7 +946,11 @@ func (client *AdminClient) GetRestoreStatus() (string, error) {
 		return "", client.mockError
 	}
 
-	return fmt.Sprintf("%s\n", client.restoreURL), nil
+	if client.restoreURL == "" {
+		return "", nil
+	}
+
+	return fmt.Sprintf("%s, State: completed\n", client.restoreURL), nil
 }
 
 // MockClientVersion returns a mocked client version
@@ -1160,4 +1205,120 @@ func (client *AdminClient) SetProcessesUnderMaintenance(ids []fdbv1beta2.Process
 func (client *AdminClient) GetVersionFromReachableCoordinators() string {
 	// TODO (johscheuer): In the future we could allow to mock another running version.
 	return client.Cluster.Status.RunningVersion
+}
+
+func (client *AdminClient) getAdditionTime() time.Time {
+	if client.MockAdditionTimeForGlobalCoordination.IsZero() {
+		return time.Now()
+	}
+
+	return client.MockAdditionTimeForGlobalCoordination
+}
+
+func (client *AdminClient) handleUpdate(updateMap map[fdbv1beta2.ProcessGroupID]time.Time, updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	for processGroupID, action := range updates {
+		if action == fdbv1beta2.UpdateActionAdd {
+			updateMap[processGroupID] = client.getAdditionTime()
+			continue
+		}
+
+		if action == fdbv1beta2.UpdateActionDelete {
+			delete(updateMap, processGroupID)
+			continue
+		}
+
+		return fmt.Errorf("unknown update action: %v", action)
+	}
+
+	return nil
+}
+
+// UpdatePendingForRemoval updates the set of process groups that are marked for removal, an update can be either the addition or removal of a process group.
+func (client *AdminClient) UpdatePendingForRemoval(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.handleUpdate(client.pendingForRemoval, updates)
+}
+
+// UpdatePendingForExclusion updates the set of process groups that should be excluded, an update can be either the addition or removal of a process group.
+func (client *AdminClient) UpdatePendingForExclusion(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.handleUpdate(client.pendingForExclusion, updates)
+}
+
+// UpdatePendingForInclusion updates the set of process groups that should be included, an update can be either the addition or removal of a process group.
+func (client *AdminClient) UpdatePendingForInclusion(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.handleUpdate(client.pendingForInclusion, updates)
+}
+
+// UpdatePendingForRestart updates the set of process groups that should be restarted, an update can be either the addition or removal of a process group.
+func (client *AdminClient) UpdatePendingForRestart(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.handleUpdate(client.pendingForRestart, updates)
+}
+
+// UpdateReadyForExclusion updates the set of process groups that are ready to be excluded, an update can be either the addition or removal of a process group.
+func (client *AdminClient) UpdateReadyForExclusion(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.handleUpdate(client.readyForExclusion, updates)
+}
+
+// UpdateReadyForInclusion updates the set of process groups that are ready to be included, an update can be either the addition or removal of a process group.
+func (client *AdminClient) UpdateReadyForInclusion(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.handleUpdate(client.readyForInclusion, updates)
+}
+
+// UpdateReadyForRestart updates the set of process groups that are ready to be restarted, an update can be either the addition or removal of a process group
+func (client *AdminClient) UpdateReadyForRestart(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.handleUpdate(client.readyForRestart, updates)
+}
+
+// GetPendingForRemoval gets the process group IDs for all process groups that are marked for removal.
+func (client *AdminClient) GetPendingForRemoval(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.handleGetReadyOrPending(prefix, client.pendingForRemoval)
+}
+
+// GetPendingForExclusion gets the process group IDs for all process groups that should be excluded.
+func (client *AdminClient) GetPendingForExclusion(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.handleGetReadyOrPending(prefix, client.pendingForExclusion)
+}
+
+// GetPendingForInclusion gets the process group IDs for all the process groups that should be included.
+func (client *AdminClient) GetPendingForInclusion(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.handleGetReadyOrPending(prefix, client.pendingForInclusion)
+}
+
+// GetPendingForRestart gets the process group IDs for all the process groups that should be restarted.
+func (client *AdminClient) GetPendingForRestart(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.handleGetReadyOrPending(prefix, client.pendingForRestart)
+}
+
+// GetReadyForExclusion gets the process group IDs for all the process groups that are ready to be excluded.
+func (client *AdminClient) GetReadyForExclusion(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.handleGetReadyOrPending(prefix, client.readyForExclusion)
+}
+
+// GetReadyForInclusion gets the process group IDs for all the process groups that are ready to be included.
+func (client *AdminClient) GetReadyForInclusion(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.handleGetReadyOrPending(prefix, client.readyForInclusion)
+}
+
+// GetReadyForRestart gets the process group IDs for all the process groups that are ready to be restarted.
+func (client *AdminClient) GetReadyForRestart(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.handleGetReadyOrPending(prefix, client.readyForRestart)
+}
+
+// ClearReadyForRestart removes all the process group IDs for all the process groups that are ready to be restarted.
+func (client *AdminClient) ClearReadyForRestart() error {
+	client.readyForRestart = make(map[fdbv1beta2.ProcessGroupID]time.Time)
+	return nil
+}
+
+func (client *AdminClient) handleGetReadyOrPending(prefix string, processes map[fdbv1beta2.ProcessGroupID]time.Time) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	result := map[fdbv1beta2.ProcessGroupID]time.Time{}
+
+	for processGroupID, timestamp := range processes {
+		if !strings.HasPrefix(string(processGroupID), prefix) {
+			continue
+		}
+
+		result[processGroupID] = timestamp
+	}
+
+	return result, nil
 }

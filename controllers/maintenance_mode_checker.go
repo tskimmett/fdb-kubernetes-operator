@@ -23,10 +23,12 @@ package controllers
 import (
 	"context"
 	"fmt"
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal/maintenance"
-	"github.com/go-logr/logr"
 	"time"
+
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal/maintenance"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbstatus"
+	"github.com/go-logr/logr"
 )
 
 // maintenanceModeChecker provides a reconciliation step for clearing the maintenance mode if all the processes in the current maintenance zone have been restarted.
@@ -89,10 +91,16 @@ func (c maintenanceModeChecker) reconcile(_ context.Context, r *FoundationDBClus
 		return &requeue{message: fmt.Sprintf("Waiting for %d processes in zone %s to be updated", len(processesToUpdate), status.Cluster.MaintenanceZone), delayedRequeue: true, delay: 5 * time.Second}
 	}
 
+	// Check if the maintenance mode can be removed.
+	err = fdbstatus.CanSafelyRemoveMaintenanceMode(status)
+	if err != nil {
+		return &requeue{curError: err, delayedRequeue: true}
+	}
+
 	// Make sure we take a lock before we continue.
-	hasLock, err := r.takeLock(logger, cluster, "maintenance mode check")
-	if !hasLock {
-		return &requeue{curError: err}
+	err = r.takeLock(logger, cluster, "maintenance mode check")
+	if err != nil {
+		return &requeue{curError: err, delayedRequeue: true}
 	}
 
 	logger.Info("Switching off maintenance mode", "zone", status.Cluster.MaintenanceZone)

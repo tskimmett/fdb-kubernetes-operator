@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2020 Apple Inc. and the FoundationDB project authors
+ * Copyright 2018-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,9 +24,9 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbadminclient"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbadminclient"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 )
 
 // LockClient provides a mock client for managing operation locks.
@@ -42,9 +42,11 @@ type LockClient struct {
 	pendingUpgrades map[fdbv1beta2.Version]map[fdbv1beta2.ProcessGroupID]bool
 }
 
+var _ fdbadminclient.LockClient = (*LockClient)(nil)
+
 // TakeLock attempts to acquire a lock.
-func (client *LockClient) TakeLock() (bool, error) {
-	return true, nil
+func (client *LockClient) TakeLock() error {
+	return nil
 }
 
 // Disabled determines if the client should automatically grant locks.

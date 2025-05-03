@@ -36,15 +36,16 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/apple/foundationdb/fdbkubernetesmonitor/api"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/e2e/fixtures"
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbstatus"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/e2e/fixtures"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbstatus"
 	chaosmesh "github.com/chaos-mesh/chaos-mesh/api/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -665,11 +666,18 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 	})
 
 	When("changing the public IP source", func() {
-		It("should change the public IP source and create/delete services", func() {
+		BeforeEach(func() {
+			if fdbCluster.GetCluster().UseDNSInClusterFile() {
+				Skip("using DNS and public IP from service is not tested")
+			}
+
 			log.Printf("set public IP source to %s", fdbv1beta2.PublicIPSourceService)
 			Expect(
 				fdbCluster.SetPublicIPSource(fdbv1beta2.PublicIPSourceService),
 			).ShouldNot(HaveOccurred())
+		})
+
+		It("should change the public IP source and create/delete services", func() {
 			Eventually(func() bool {
 				pods := fdbCluster.GetPods()
 				svcList := fdbCluster.GetServices()
@@ -1243,10 +1251,12 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 		})
 
 		AfterEach(func() {
-			Expect(fdbCluster.UpdateStorageClass(
-				defaultStorageClass,
-				fdbv1beta2.ProcessClassLog,
-			)).NotTo(HaveOccurred())
+			if defaultStorageClass != "" {
+				Expect(fdbCluster.UpdateStorageClass(
+					defaultStorageClass,
+					fdbv1beta2.ProcessClassLog,
+				)).NotTo(HaveOccurred())
+			}
 		})
 	})
 
@@ -1347,8 +1357,9 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 
 			Expect(
 				fdbCluster.SetCustomParameters(
-					fdbv1beta2.ProcessClassGeneral,
-					newGeneralCustomParameters,
+					map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters{
+						fdbv1beta2.ProcessClassGeneral: newGeneralCustomParameters,
+					},
 					false,
 				),
 			).NotTo(HaveOccurred())
@@ -1356,8 +1367,9 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 
 		AfterEach(func() {
 			Expect(fdbCluster.SetCustomParameters(
-				fdbv1beta2.ProcessClassGeneral,
-				initialGeneralCustomParameters,
+				map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters{
+					fdbv1beta2.ProcessClassGeneral: initialGeneralCustomParameters,
+				},
 				false,
 			)).NotTo(HaveOccurred())
 			fdbCluster.SetIgnoreDuringRestart(nil)
@@ -1584,15 +1596,7 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 
 	When("migrating a cluster to make use of DNS in the cluster file", func() {
 		BeforeEach(func() {
-			cluster := fdbCluster.GetCluster()
-			parsedVersion, err := fdbv1beta2.ParseFdbVersion(cluster.Status.RunningVersion)
-			Expect(err).NotTo(HaveOccurred())
-
-			if !parsedVersion.SupportsDNSInClusterFile() {
-				Skip(fmt.Sprintf("current FoundationDB version %s doesn't support DNS", parsedVersion.String()))
-			}
-
-			if cluster.UseDNSInClusterFile() {
+			if fdbCluster.GetCluster().UseDNSInClusterFile() {
 				Skip("cluster already uses DNS")
 			}
 
@@ -1850,7 +1854,7 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 		})
 
 		It("should configure the database to run with GRV and commit proxies but keep the proxies in the status field of the FoundationDB resource", func() {
-			// Make sure the FoundationDB configured GRV and commit proxies.
+			// Make sure GRV and commit proxies are configured.
 			status := fdbCluster.GetStatus()
 			Expect(status.Cluster.DatabaseConfiguration.RoleCounts.CommitProxies).To(BeNumerically(">", 0))
 			Expect(status.Cluster.DatabaseConfiguration.RoleCounts.GrvProxies).To(BeNumerically(">", 0))
@@ -2038,12 +2042,6 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 			// We can remove this once 7.1 is the default version.
 			factory.DeleteChaosMeshExperimentSafe(scheduleInjectPodKill)
 			cluster := fdbCluster.GetCluster()
-			parsedVersion, err := fdbv1beta2.ParseFdbVersion(cluster.Status.RunningVersion)
-			Expect(err).NotTo(HaveOccurred())
-
-			if !parsedVersion.SupportsDNSInClusterFile() {
-				Skip(fmt.Sprintf("current FoundationDB version %s doesn't support DNS", parsedVersion.String()))
-			}
 
 			initialSetting = cluster.UseDNSInClusterFile()
 			if !cluster.UseDNSInClusterFile() {
@@ -2210,7 +2208,7 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 				_, _, err := fdbCluster.RunFdbCliCommandInOperatorWithoutRetry(cmd, true, 20)
 
 				return err
-			}).WithTimeout(2 * time.Minute).ShouldNot(HaveOccurred())
+			}).WithTimeout(5 * time.Minute).WithPolling(15 * time.Second).ShouldNot(HaveOccurred())
 
 			command := fmt.Sprintf("maintenance on %s %s", pickedProcessGroup.FaultDomain, "3600")
 			_, _ = fdbCluster.RunFdbCliCommandInOperator(command, false, 20)
@@ -2249,11 +2247,11 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 	})
 
 	When("the Pod IP family is set", func() {
-		var initialPodIPFamily *int
+		var initialPodIPFamily int
 
 		BeforeEach(func() {
 			cluster := fdbCluster.GetCluster()
-			initialPodIPFamily = cluster.Spec.Routing.PodIPFamily
+			initialPodIPFamily = cluster.GetPodIPFamily()
 
 			spec := cluster.Spec.DeepCopy()
 			spec.Routing.PodIPFamily = pointer.Int(4)
@@ -2300,7 +2298,7 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 
 		AfterEach(func() {
 			spec := fdbCluster.GetCluster().Spec.DeepCopy()
-			spec.Routing.PodIPFamily = initialPodIPFamily
+			spec.Routing.PodIPFamily = pointer.Int(initialPodIPFamily)
 			fdbCluster.UpdateClusterSpecWithSpec(spec)
 			Expect(fdbCluster.WaitForReconciliation()).NotTo(HaveOccurred())
 		})
@@ -2323,8 +2321,9 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 
 			Expect(
 				fdbCluster.SetCustomParameters(
-					fdbv1beta2.ProcessClassGeneral,
-					newGeneralCustomParameters,
+					map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters{
+						fdbv1beta2.ProcessClassGeneral: newGeneralCustomParameters,
+					},
 					false,
 				),
 			).NotTo(HaveOccurred())
@@ -2332,8 +2331,9 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 
 		AfterEach(func() {
 			Expect(fdbCluster.SetCustomParameters(
-				fdbv1beta2.ProcessClassGeneral,
-				initialGeneralCustomParameters,
+				map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters{
+					fdbv1beta2.ProcessClassGeneral: initialGeneralCustomParameters,
+				},
 				true,
 			)).NotTo(HaveOccurred())
 		})
@@ -2418,11 +2418,12 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 			)
 			Expect(
 				fdbCluster.SetCustomParameters(
-					fdbv1beta2.ProcessClassStorage,
-					append(
-						initialCustomParameters,
-						"knob_max_trace_lines=1000000",
-					),
+					map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters{
+						fdbv1beta2.ProcessClassStorage: append(
+							initialCustomParameters,
+							"knob_max_trace_lines=1000000",
+						),
+					},
 					false,
 				),
 			).NotTo(HaveOccurred())
@@ -2489,8 +2490,9 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 		AfterEach(func() {
 			factory.DeleteChaosMeshExperimentSafe(exp)
 			Expect(fdbCluster.SetCustomParameters(
-				fdbv1beta2.ProcessClassStorage,
-				initialCustomParameters,
+				map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters{
+					fdbv1beta2.ProcessClassStorage: initialCustomParameters,
+				},
 				true,
 			)).NotTo(HaveOccurred())
 		})
@@ -2544,11 +2546,12 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 
 			// Update the storage processes to have the new locality.
 			Expect(fdbCluster.SetCustomParameters(
-				fdbv1beta2.ProcessClassStorage,
-				append(
-					initialParameters,
-					"locality_os=$NODE_LABEL_KUBERNETES_IO_OS",
-				),
+				map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters{
+					fdbv1beta2.ProcessClassStorage: append(
+						initialParameters,
+						"locality_os=$NODE_LABEL_KUBERNETES_IO_OS",
+					),
+				},
 				true,
 			)).NotTo(HaveOccurred())
 
@@ -2568,8 +2571,9 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 
 		AfterEach(func() {
 			Expect(fdbCluster.SetCustomParameters(
-				fdbv1beta2.ProcessClassStorage,
-				initialParameters,
+				map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters{
+					fdbv1beta2.ProcessClassStorage: initialParameters,
+				},
 				true,
 			)).NotTo(HaveOccurred())
 		})
@@ -2632,11 +2636,12 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 
 			Expect(
 				fdbCluster.SetCustomParameters(
-					fdbv1beta2.ProcessClassStorage,
-					append(
-						initialCustomParameters,
-						"knob_read_sampling_enabled=true",
-					),
+					map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters{
+						fdbv1beta2.ProcessClassStorage: append(
+							initialCustomParameters,
+							"knob_read_sampling_enabled=true",
+						),
+					},
 					false,
 				),
 			).NotTo(HaveOccurred())
@@ -2644,8 +2649,9 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 
 		AfterEach(func() {
 			Expect(fdbCluster.SetCustomParameters(
-				fdbv1beta2.ProcessClassStorage,
-				initialCustomParameters,
+				map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters{
+					fdbv1beta2.ProcessClassStorage: initialCustomParameters,
+				},
 				true,
 			)).NotTo(HaveOccurred())
 		})
@@ -2681,6 +2687,7 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 			fdbCluster.UpdateClusterSpecWithSpec(spec)
 
 			fdbCluster.ReplacePod(pickedPod, false)
+			var pickedProcessGroup *fdbv1beta2.ProcessGroupStatus
 			Expect(fdbCluster.WaitUntilWithForceReconcile(1, 900, func(cluster *fdbv1beta2.FoundationDBCluster) bool {
 				for _, processGroup := range cluster.Status.ProcessGroups {
 					if processGroup.ProcessGroupID != pickedProcessGroupID {
@@ -2688,14 +2695,24 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 					}
 
 					initialExclusionTimestamp = processGroup.ExclusionTimestamp
+					pickedProcessGroup = processGroup
 					break
 				}
 
 				log.Println("initialExclusionTimestamp", initialExclusionTimestamp)
 				return initialExclusionTimestamp != nil
 			})).NotTo(HaveOccurred(), "process group is missing the exclusion timestamp")
+
+			var excludedServer fdbv1beta2.ExcludedServers
+			if fdbCluster.GetCluster().UseLocalitiesForExclusion() {
+				Expect(pickedProcessGroup).NotTo(BeNil())
+				excludedServer = fdbv1beta2.ExcludedServers{Locality: pickedProcessGroup.GetExclusionString()}
+			} else {
+				excludedServer = fdbv1beta2.ExcludedServers{Address: pickedPod.Status.PodIP}
+			}
+
 			// Ensure that the IP is excluded
-			Expect(fdbCluster.GetStatus().Cluster.DatabaseConfiguration.ExcludedServers).To(ContainElements(fdbv1beta2.ExcludedServers{Address: pickedPod.Status.PodIP}))
+			Expect(fdbCluster.GetStatus().Cluster.DatabaseConfiguration.ExcludedServers).To(ContainElements(excludedServer))
 		})
 
 		AfterEach(func() {
@@ -2729,6 +2746,52 @@ var _ = Describe("Operator", Label("e2e", "pr"), func() {
 				Expect(initialExclusionTimestamp.Before(newExclusionTimestamp)).To(BeTrue())
 				Expect(initialExclusionTimestamp).NotTo(Equal(newExclusionTimestamp))
 			})
+		})
+	})
+
+	When("the pod IP family is changed", func() {
+		var initialPods []string
+		var podIPFamily = fdbv1beta2.PodIPFamilyIPv4
+
+		BeforeEach(func() {
+			pods := fdbCluster.GetPods()
+			for _, pod := range pods.Items {
+				initialPods = append(initialPods, pod.Name)
+			}
+
+			spec := fdbCluster.GetCluster().Spec.DeepCopy()
+			spec.Routing.PodIPFamily = pointer.Int(podIPFamily)
+			fdbCluster.UpdateClusterSpecWithSpec(spec)
+			Expect(fdbCluster.WaitForReconciliation()).To(Succeed())
+		})
+
+		AfterEach(func() {
+			spec := fdbCluster.GetCluster().Spec.DeepCopy()
+			spec.Routing.PodIPFamily = nil
+			fdbCluster.UpdateClusterSpecWithSpec(spec)
+			Expect(fdbCluster.WaitForReconciliation(fixtures.SoftReconcileOption(true))).To(Succeed())
+		})
+
+		It("should replace all pods and configure them properly", func() {
+			pods := fdbCluster.GetPods()
+			podIPFamilyString := strconv.Itoa(podIPFamily)
+
+			newPods := make([]string, 0, len(pods.Items))
+			for _, pod := range pods.Items {
+				if !pod.DeletionTimestamp.IsZero() {
+					continue
+				}
+
+				if pod.Status.Phase != corev1.PodRunning {
+					log.Println("ignoring pod:", pod.Name, "with pod phase", pod.Status.Phase, "message:", pod.Status.Message)
+					continue
+				}
+
+				newPods = append(newPods, pod.Name)
+				Expect(pod.Annotations).To(HaveKeyWithValue(fdbv1beta2.IPFamilyAnnotation, podIPFamilyString))
+			}
+
+			Expect(newPods).NotTo(ContainElements(initialPods))
 		})
 	})
 })

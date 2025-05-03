@@ -21,7 +21,7 @@
 package fixtures
 
 import (
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -51,9 +51,15 @@ func (factory *Factory) createFDBClusterSpec(
 	faultDomain := fdbv1beta2.FoundationDBClusterFaultDomain{
 		Key: "foundationdb.org/none",
 	}
+
 	if config.SimulateCustomFaultDomainEnv {
 		faultDomain.ValueFrom = "$" + fdbv1beta2.EnvNameInstanceID
 		faultDomain.Key = corev1.LabelHostname
+	}
+
+	if config.GetRedundancyMode() == fdbv1beta2.RedundancyModeThreeDataHall {
+		faultDomain.Key = corev1.LabelHostname
+		faultDomain.ValueFrom = ""
 	}
 
 	return &fdbv1beta2.FoundationDBCluster{
@@ -93,10 +99,11 @@ func (factory *Factory) createFDBClusterSpec(
 				IgnoreLogGroupsForUpgrade: []fdbv1beta2.LogGroup{
 					"fdb-kubernetes-operator",
 				},
-				UseLocalitiesForExclusion: pointer.Bool(config.UseLocalityBasedExclusions),
+				UseLocalitiesForExclusion: config.UseLocalityBasedExclusions,
+				SynchronizationMode:       pointer.String(string(config.SynchronizationMode)),
 			},
 			Routing: fdbv1beta2.RoutingConfig{
-				UseDNSInClusterFile: pointer.Bool(config.UseDNS),
+				UseDNSInClusterFile: config.UseDNS,
 				HeadlessService: pointer.Bool(
 					true,
 				), // to make switching between hostname <-> IP smooth
@@ -106,20 +113,18 @@ func (factory *Factory) createFDBClusterSpec(
 }
 
 func (factory *Factory) createPodTemplate(
-	nodeSelector map[string]string,
-	resources corev1.ResourceList,
-	setLimits bool,
-	sidecarResources corev1.ResourceList,
+	processClass fdbv1beta2.ProcessClass,
+	config *ClusterConfig,
 ) *corev1.PodTemplateSpec {
-	// the operator is causing this to not work as desired reference:
-	// https://github.com/FoundationDB/fdb-kubernetes-operator/blob/main/internal/deprecations.go#L75-L77
+	// The operator is causing this to not work as desired reference:
+	// https://github.com/FoundationDB/fdb-kubernetes-operator/v2/blob/main/internal/deprecations.go#L75-L77
 	mainContainerResources := corev1.ResourceRequirements{
-		Requests: resources,
+		Requests: config.generatePodResources(processClass),
 	}
 
-	// See: https://github.com/FoundationDB/fdb-kubernetes-operator/blob/main/docs/manual/warnings.md#resource-requirements otherwise
+	// See: https://github.com/FoundationDB/fdb-kubernetes-operator/v2/blob/main/docs/manual/warnings.md#resource-requirements otherwise
 	// the operator will set the default limits.
-	if !setLimits {
+	if !config.Performance {
 		mainContainerResources.Limits = corev1.ResourceList{
 			"org.foundationdb/empty": resource.MustParse("0"),
 		}
@@ -150,6 +155,22 @@ func (factory *Factory) createPodTemplate(
 		}
 	}
 
+	var topologySpreadConstraints []corev1.TopologySpreadConstraint
+	if config.GetRedundancyMode() == fdbv1beta2.RedundancyModeThreeDataHall {
+		topologySpreadConstraints = []corev1.TopologySpreadConstraint{
+			{
+				MaxSkew:           1,
+				TopologyKey:       corev1.LabelTopologyZone,
+				WhenUnsatisfiable: corev1.DoNotSchedule,
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						fdbv1beta2.FDBClusterLabel: config.Name,
+					},
+				},
+			},
+		}
+	}
+
 	return &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			// Tell the cluster autoscaler never to remove a node that an FDB pod is running on.
@@ -157,7 +178,7 @@ func (factory *Factory) createPodTemplate(
 		},
 		Spec: corev1.PodSpec{
 			ServiceAccountName: foundationdbServiceAccount,
-			NodeSelector:       nodeSelector,
+			NodeSelector:       config.NodeSelector,
 			// We add this Affinity to try to spread Pods across different nodes. Since we use the "fake"
 			// fault domain the operator won't add this Affinity automatically. This requirement is optional and might
 			// or might not be honoured.
@@ -172,7 +193,8 @@ func (factory *Factory) createPodTemplate(
 									MatchExpressions: []metav1.LabelSelectorRequirement{
 										{
 											Key:      fdbv1beta2.FDBClusterLabel,
-											Operator: metav1.LabelSelectorOpExists,
+											Values:   []string{config.Name},
+											Operator: metav1.LabelSelectorOpIn,
 										},
 									},
 								},
@@ -181,7 +203,8 @@ func (factory *Factory) createPodTemplate(
 					},
 				},
 			},
-			InitContainers: initContainers,
+			TopologySpreadConstraints: topologySpreadConstraints,
+			InitContainers:            initContainers,
 			SecurityContext: &corev1.PodSecurityContext{
 				FSGroup: pointer.Int64(4059),
 			},
@@ -212,11 +235,15 @@ func (factory *Factory) createPodTemplate(
 						},
 						{
 							Name:  fdbv1beta2.EnvNameTLSVerifyPeers,
-							Value: "I.CN=localhost,I.O=Example Inc.,S.CN=localhost,S.O=Example Inc.",
+							Value: config.TLSPeerVerification,
 						},
 						{
 							Name:  fdbv1beta2.EnvNameFDBTraceLogDirPath,
 							Value: "/var/log/fdb-trace-logs",
+						},
+						{
+							Name:  "ENABLE_NODE_WATCH",
+							Value: "true",
 						},
 					},
 					VolumeMounts: []corev1.VolumeMount{
@@ -238,7 +265,7 @@ func (factory *Factory) createPodTemplate(
 						), // to allow I/O chaos to succeed
 					},
 					Resources: corev1.ResourceRequirements{
-						Requests: sidecarResources,
+						Requests: config.generateSidecarResources(),
 					},
 					Env: []corev1.EnvVar{
 						{
@@ -255,7 +282,7 @@ func (factory *Factory) createPodTemplate(
 						},
 						{
 							Name:  fdbv1beta2.EnvNameTLSVerifyPeers,
-							Value: "I.CN=localhost,I.O=Example Inc.,S.CN=localhost,S.O=Example Inc.",
+							Value: config.TLSPeerVerification,
 						},
 					},
 					VolumeMounts: []corev1.VolumeMount{
@@ -286,25 +313,19 @@ func (factory *Factory) createProcesses(
 	config *ClusterConfig,
 ) map[fdbv1beta2.ProcessClass]fdbv1beta2.ProcessSettings {
 	claimTemplate := config.generateVolumeClaimTemplate(factory.GetDefaultStorageClass())
-	sidecarResources := config.generateSidecarResources()
-
 	return map[fdbv1beta2.ProcessClass]fdbv1beta2.ProcessSettings{
 		fdbv1beta2.ProcessClassGeneral: {
 			PodTemplate: factory.createPodTemplate(
-				config.NodeSelector,
-				config.generatePodResources(fdbv1beta2.ProcessClassGeneral),
-				config.Performance,
-				sidecarResources,
+				fdbv1beta2.ProcessClassGeneral,
+				config,
 			),
 			VolumeClaimTemplate: claimTemplate,
 			CustomParameters:    config.getCustomParametersForProcessClass(fdbv1beta2.ProcessClassGeneral),
 		},
 		fdbv1beta2.ProcessClassStorage: {
 			PodTemplate: factory.createPodTemplate(
-				config.NodeSelector,
-				config.generatePodResources(fdbv1beta2.ProcessClassStorage),
-				config.Performance,
-				sidecarResources,
+				fdbv1beta2.ProcessClassStorage,
+				config,
 			),
 			VolumeClaimTemplate: claimTemplate,
 			CustomParameters:    config.getCustomParametersForProcessClass(fdbv1beta2.ProcessClassStorage),

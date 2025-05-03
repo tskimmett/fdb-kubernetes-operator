@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"reflect"
 
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -34,13 +36,13 @@ import (
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/podmanager"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/podmanager"
 )
 
 // ReplaceMisconfiguredProcessGroups checks if the cluster has any misconfigured process groups that must be replaced.
-func ReplaceMisconfiguredProcessGroups(ctx context.Context, podManager podmanager.PodLifecycleManager, client client.Client, log logr.Logger, cluster *fdbv1beta2.FoundationDBCluster, pvcMap map[fdbv1beta2.ProcessGroupID]corev1.PersistentVolumeClaim, replaceOnSecurityContextChange bool) (bool, error) {
+func ReplaceMisconfiguredProcessGroups(ctx context.Context, podManager podmanager.PodLifecycleManager, ctrlClient client.Client, log logr.Logger, cluster *fdbv1beta2.FoundationDBCluster, replaceOnSecurityContextChange bool) (bool, error) {
 	hasReplacements := false
 
 	maxReplacements, _ := getReplacementInformation(cluster, cluster.GetMaxConcurrentReplacements())
@@ -54,7 +56,7 @@ func ReplaceMisconfiguredProcessGroups(ctx context.Context, podManager podmanage
 			continue
 		}
 
-		needsRemoval, err := ProcessGroupNeedsRemoval(ctx, podManager, client, log, cluster, processGroup, pvcMap, replaceOnSecurityContextChange)
+		needsRemoval, err := ProcessGroupNeedsRemoval(ctx, podManager, ctrlClient, log, cluster, processGroup, replaceOnSecurityContextChange)
 
 		// Do not mark for removal if there is an error
 		if err != nil {
@@ -72,22 +74,26 @@ func ReplaceMisconfiguredProcessGroups(ctx context.Context, podManager podmanage
 }
 
 // ProcessGroupNeedsRemoval checks if a process group needs to be removed.
-func ProcessGroupNeedsRemoval(ctx context.Context, podManager podmanager.PodLifecycleManager, client client.Client, log logr.Logger, cluster *fdbv1beta2.FoundationDBCluster, processGroup *fdbv1beta2.ProcessGroupStatus, pvcMap map[fdbv1beta2.ProcessGroupID]corev1.PersistentVolumeClaim, replaceOnSecurityContextChange bool) (bool, error) {
-	// TODO(johscheuer): Fix how we fetch the pvc to make better use of the controller runtime cache.
-	pvc, hasPVC := pvcMap[processGroup.ProcessGroupID]
-	pod, podErr := podManager.GetPod(ctx, client, cluster, processGroup.GetPodName(cluster))
-	if hasPVC {
-		needsPVCRemoval, err := processGroupNeedsRemovalForPVC(cluster, pvc, log, processGroup)
+func ProcessGroupNeedsRemoval(ctx context.Context, podManager podmanager.PodLifecycleManager, ctrlClient client.Client, log logr.Logger, cluster *fdbv1beta2.FoundationDBCluster, processGroup *fdbv1beta2.ProcessGroupStatus, replaceOnSecurityContextChange bool) (bool, error) {
+	pod, podErr := podManager.GetPod(ctx, ctrlClient, cluster, processGroup.GetPodName(cluster))
+	if processGroup.ProcessClass.IsStateful() {
+		pvc := &corev1.PersistentVolumeClaim{}
+		err := ctrlClient.Get(ctx, client.ObjectKey{Namespace: cluster.Namespace, Name: processGroup.GetPvcName(cluster)}, pvc)
 		if err != nil {
-			return false, err
-		}
+			if k8serrors.IsNotFound(err) {
+				log.V(1).Info("Could not find PVC for process group ID",
+					"processGroupID", processGroup.ProcessGroupID)
+			}
+		} else {
+			needsPVCRemoval, err := processGroupNeedsRemovalForPVC(cluster, pvc, log, processGroup)
+			if err != nil {
+				return false, err
+			}
 
-		if needsPVCRemoval && podErr == nil {
-			return true, nil
+			if needsPVCRemoval && podErr == nil {
+				return true, nil
+			}
 		}
-	} else if processGroup.ProcessClass.IsStateful() {
-		log.V(1).Info("Could not find PVC for process group ID",
-			"processGroupID", processGroup.ProcessGroupID)
 	}
 
 	if podErr != nil {
@@ -99,7 +105,7 @@ func ProcessGroupNeedsRemoval(ctx context.Context, podManager podmanager.PodLife
 	return processGroupNeedsRemovalForPod(cluster, pod, processGroup, log, replaceOnSecurityContextChange)
 }
 
-func processGroupNeedsRemovalForPVC(cluster *fdbv1beta2.FoundationDBCluster, pvc corev1.PersistentVolumeClaim, log logr.Logger, processGroup *fdbv1beta2.ProcessGroupStatus) (bool, error) {
+func processGroupNeedsRemovalForPVC(cluster *fdbv1beta2.FoundationDBCluster, pvc *corev1.PersistentVolumeClaim, log logr.Logger, processGroup *fdbv1beta2.ProcessGroupStatus) (bool, error) {
 	processGroupID := internal.GetProcessGroupIDFromMeta(cluster, pvc.ObjectMeta)
 	logger := log.WithValues("namespace", cluster.Namespace, "cluster", cluster.Name, "pvc", pvc.Name, "processGroupID", processGroupID)
 
@@ -229,6 +235,21 @@ func processGroupNeedsRemovalForPod(cluster *fdbv1beta2.FoundationDBCluster, pod
 		return true, nil
 	}
 
+	podIPFamily, err := internal.GetIPFamily(pod)
+	if err != nil {
+		return false, err
+	}
+
+	if cluster.GetPodIPFamily() != podIPFamily {
+		logger.Info("Replace process group",
+			"reason", "pod IP family has changed",
+			"currentPodIPFamily", podIPFamily,
+			"desiredPodIPFamily", cluster.GetPodIPFamily(),
+		)
+
+		return true, nil
+	}
+
 	if cluster.NeedsReplacement(processGroup) {
 		jsonSpec, err := json.Marshal(spec)
 		if err != nil {
@@ -292,7 +313,7 @@ type containerFileSecurityContext struct {
 // fileSecurityContextChanged checks for changes in the effective security context by checking that there are no changes
 // to the following SecurityContext (or PodSecurityContext) fields:
 // RunAsGroup, RunAsUser, FSGroup, or FSGroupChangePolicy
-// See https://github.com/FoundationDB/fdb-kubernetes-operator/issues/208 for motivation
+// See https://github.com/FoundationDB/fdb-kubernetes-operator/v2/issues/208 for motivation
 // only makes sense if both pods have containers with matching names
 func fileSecurityContextChanged(desired, current *corev1.PodSpec, log logr.Logger) bool {
 	// first check for FSGroup or FSGroupChangePolicy changes as that cannot be overridden at container level

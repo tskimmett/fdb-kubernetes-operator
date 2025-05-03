@@ -24,12 +24,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/e2e/fixtures"
-	. "github.com/onsi/gomega"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/e2e/fixtures"
+	"github.com/onsi/gomega"
 )
 
 func TestOperatorHaUpgrade(t *testing.T) {
-	SetDefaultEventuallyTimeout(3 * time.Minute)
+	gomega.SetDefaultEventuallyTimeout(3 * time.Minute)
 	fixtures.SetTestSuiteName("operator-ha-upgrades")
 	fixtures.RunGinkgoTests(t, "FDB Operator HA Upgrade Test Suite")
 }

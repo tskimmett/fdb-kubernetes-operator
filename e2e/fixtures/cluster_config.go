@@ -21,13 +21,11 @@
 package fixtures
 
 import (
-	"fmt"
 	"log"
 	"math"
-	"strconv"
 	"strings"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	"github.com/onsi/ginkgo/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -57,6 +55,10 @@ const (
 
 // GetRedundancyMode returns the redundancy mode based on the cluster configuration.
 func (config ClusterConfig) GetRedundancyMode() fdbv1beta2.RedundancyMode {
+	if config.RedundancyMode != "" {
+		return config.RedundancyMode
+	}
+
 	if config.HaMode == HaFourZoneDoubleSatRF4 {
 		return fdbv1beta2.RedundancyModeDouble
 	}
@@ -73,9 +75,9 @@ type ClusterConfig struct {
 	// UseMaintenanceMode if enabled the FoundationDBCluster resource will enable the maintenance mode.
 	UseMaintenanceMode bool
 	// UseLocalityBasedExclusions if enabled the FoundationDBCluster resource will enable the locality based exclusions.
-	UseLocalityBasedExclusions bool
+	UseLocalityBasedExclusions *bool
 	// UseDNS if enabled the FoundationDBCluster resource will enable the DNS feature.
-	UseDNS bool
+	UseDNS *bool
 	// If enabled the cluster will be setup with the unified image.
 	UseUnifiedImage *bool
 	// SimulateCustomFaultDomainEnv will simulate the use case that a user has set a custom environment variable to
@@ -92,6 +94,12 @@ type ClusterConfig struct {
 	StorageServerPerPod int
 	// LogServersPerPod defines the value that is set in the FoundationDBClusterSpec for this setting.
 	LogServersPerPod int
+	// MemoryPerPodInGb defines the default memory for pods created by this cluster. If more than one process is running inside the
+	// pod the memory size will be increased proportionally. If not set, will default to 8Gi
+	MemoryPerPod string
+	// CpusPerPod defines the default CPU size for pods created by this cluster. If more than one process is running inside the
+	// pod the CPU size will be increased proportionally. If not set will default to 1.
+	CpusPerPod string
 	// VolumeSize the size of the volumes that should be created for stateful Pods.
 	VolumeSize string
 	// Namespace to create the cluster in, if empty will use a randomly generated namespace. The setup won't create the
@@ -99,6 +107,8 @@ type ClusterConfig struct {
 	Namespace string
 	// Name of the cluster to be created, if empty a random name will be used.
 	Name string
+	// TLSPeerVerification represents the TLS peer verification that should be used for the cluster.
+	TLSPeerVerification string
 	// cloudProvider defines the cloud provider used to create the Kubernetes cluster. This value is set in the SetDefaults
 	// method.
 	cloudProvider cloudProvider
@@ -112,6 +122,11 @@ type ClusterConfig struct {
 	CustomParameters map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters
 	// CreationCallback allows to specify a method that will be called after the cluster was created.
 	CreationCallback func(fdbCluster *FdbCluster)
+	// RedundancyMode defines the redundancy mode that should be used. If undefined the default is triple, except for
+	// the HaFourZoneDoubleSatRF4 configuration.
+	RedundancyMode fdbv1beta2.RedundancyMode
+	// SynchronizationMode defines the fdbv1beta2.SynchronizationMode if not set the default will be \"local\"
+	SynchronizationMode fdbv1beta2.SynchronizationMode
 }
 
 // DefaultClusterConfigWithHaMode returns the default cluster configuration with the provided HA Mode.
@@ -159,6 +174,27 @@ func (config *ClusterConfig) SetDefaults(factory *Factory) {
 	if config.cloudProvider == "" {
 		config.cloudProvider = cloudProvider(factory.options.cloudProvider)
 	}
+
+	if config.TLSPeerVerification == "" {
+		config.TLSPeerVerification = "I.CN=localhost,I.O=Example Inc.,S.CN=localhost,S.O=Example Inc."
+	}
+
+	if nodeSelector := factory.GetNodeSelector(); nodeSelector != "" {
+		splitSelector := strings.Split(nodeSelector, "=")
+		config.NodeSelector = map[string]string{splitSelector[0]: splitSelector[1]}
+	}
+
+	if config.MemoryPerPod == "" {
+		config.MemoryPerPod = "8Gi"
+	}
+
+	if config.CpusPerPod == "" {
+		config.CpusPerPod = "1"
+	}
+
+	if config.SynchronizationMode == "" {
+		config.SynchronizationMode = factory.GetSynchronizationMode()
+	}
 }
 
 // getVolumeSize returns the volume size in as a string. If no volume size is defined a default will be set based on
@@ -200,31 +236,30 @@ func (config *ClusterConfig) generateSidecarResources() corev1.ResourceList {
 func (config *ClusterConfig) generatePodResources(
 	processClass fdbv1beta2.ProcessClass,
 ) corev1.ResourceList {
-	if !config.Performance {
-		// Minimal resource requests for this cluster to be functional
-		return corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("0.2"),
-			corev1.ResourceMemory: resource.MustParse("2Gi"),
+	// FDB is single threaded so we can assign 1 CPU per process in this Pod and 8 GiB is the default memory footprint
+	// for an fdbserver process.
+	cpuResources := resource.MustParse(config.CpusPerPod)
+	memoryResources := resource.MustParse(config.MemoryPerPod)
+	originalCPUResources := cpuResources.DeepCopy()
+	originalMemoryResources := memoryResources.DeepCopy()
+
+	if processClass == fdbv1beta2.ProcessClassStorage && config.StorageServerPerPod > 1 {
+		for i := 1; i < config.StorageServerPerPod; i++ {
+			cpuResources.Add(originalCPUResources)
+			memoryResources.Add(originalMemoryResources)
 		}
 	}
 
-	// FDB is single threaded so we can assign 1 CPU per process in this Pod and 8 Gi is the default memory footprint
-	// for an fdbserver process.
-	cpu := 1
-	memory := 8
-	if processClass == fdbv1beta2.ProcessClassStorage && config.StorageServerPerPod > 1 {
-		cpu *= config.StorageServerPerPod
-		memory *= config.StorageServerPerPod
-	}
-
 	if processClass == fdbv1beta2.ProcessClassLog && config.LogServersPerPod > 1 {
-		cpu *= config.LogServersPerPod
-		memory *= config.LogServersPerPod
+		for i := 1; i < config.StorageServerPerPod; i++ {
+			cpuResources.Add(originalCPUResources)
+			memoryResources.Add(originalMemoryResources)
+		}
 	}
 
 	return corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse(strconv.Itoa(cpu)),
-		corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dGi", memory)),
+		corev1.ResourceCPU:    cpuResources,
+		corev1.ResourceMemory: memoryResources,
 	}
 }
 
@@ -261,28 +296,57 @@ func (config *ClusterConfig) CreateDatabaseConfiguration() fdbv1beta2.DatabaseCo
 	return fdbv1beta2.DatabaseConfiguration{}
 }
 
-func (config *ClusterConfig) getCustomParametersForProcessClass(processClass fdbv1beta2.ProcessClass) fdbv1beta2.FoundationDBCustomParameters {
-	customParameters, ok := config.CustomParameters[processClass]
-	if !ok {
-		return []fdbv1beta2.FoundationDBCustomParameter{
-			"trace_format=json",
+type customParameterInput struct {
+	key   string
+	value string
+}
+
+func (input *customParameterInput) getCustomParameter() fdbv1beta2.FoundationDBCustomParameter {
+	return fdbv1beta2.FoundationDBCustomParameter(input.key + "=" + input.value)
+}
+
+func addKnobIfMissing(inputs []customParameterInput, customParameters []fdbv1beta2.FoundationDBCustomParameter) fdbv1beta2.FoundationDBCustomParameters {
+	hasKnob := map[string]fdbv1beta2.None{}
+	// Check which knobs are already set.
+	for _, customParameter := range customParameters {
+		for _, input := range inputs {
+			if !strings.Contains(string(customParameter), input.key) {
+				continue
+			}
+
+			hasKnob[input.key] = fdbv1beta2.None{}
+			break
 		}
 	}
 
-	containsTraceParameter := false
-	for _, customParameter := range customParameters {
-		if !strings.Contains(string(customParameter), "trace_format") {
+	for _, input := range inputs {
+		if _, ok := hasKnob[input.key]; ok {
 			continue
 		}
 
-		containsTraceParameter = true
-	}
-
-	if !containsTraceParameter {
-		customParameters = append(customParameters, "trace_format=json")
+		customParameters = append(customParameters, input.getCustomParameter())
 	}
 
 	return customParameters
+}
+
+func (config *ClusterConfig) getCustomParametersForProcessClass(processClass fdbv1beta2.ProcessClass) fdbv1beta2.FoundationDBCustomParameters {
+	requiredKnobs := []customParameterInput{
+		{
+			key:   "trace_format",
+			value: "json",
+		},
+	}
+
+	// If the three data hall redundancy is set, we have to add the additional locality.
+	if config.GetRedundancyMode() == fdbv1beta2.RedundancyModeThreeDataHall {
+		requiredKnobs = append(requiredKnobs, customParameterInput{
+			key:   "locality_data_hall",
+			value: "$NODE_LABEL_TOPOLOGY_KUBERNETES_IO_ZONE",
+		})
+	}
+
+	return addKnobIfMissing(requiredKnobs, config.CustomParameters[processClass])
 }
 
 func getDatabaseConfigurationFourZoneSingleSat(
@@ -473,23 +537,12 @@ func (config *ClusterConfig) CalculateRoleCounts() fdbv1beta2.RoleCounts {
 		roleCounts.LogRouters = roleCounts.Logs
 	}
 
+	// Add enough log processes for the three_data_hall setup.
+	if config.GetRedundancyMode() == fdbv1beta2.RedundancyModeThreeDataHall {
+		roleCounts.Logs = max(roleCounts.Logs, 9)
+	}
+
 	return roleCounts
-}
-
-func max(a int, b int) int {
-	if a > b {
-		return a
-	}
-
-	return b
-}
-
-func min(a int, b int) int {
-	if a < b {
-		return a
-	}
-
-	return b
 }
 
 func calculateProxies(proxies int) (int, int) {
@@ -505,7 +558,6 @@ func calculateProxies(proxies int) (int, int) {
 // Copy will return a new struct of the ClusterConfig.
 func (config *ClusterConfig) Copy() *ClusterConfig {
 	return &ClusterConfig{
-		Performance:                config.Performance,
 		DebugSymbols:               config.DebugSymbols,
 		UseMaintenanceMode:         config.UseMaintenanceMode,
 		CreationTracker:            config.CreationTracker,
@@ -525,5 +577,8 @@ func (config *ClusterConfig) Copy() *ClusterConfig {
 		UseDNS:                     config.UseDNS,
 		UseLocalityBasedExclusions: config.UseLocalityBasedExclusions,
 		UseUnifiedImage:            config.UseUnifiedImage,
+		MemoryPerPod:               config.MemoryPerPod,
+		CpusPerPod:                 config.CpusPerPod,
+		SynchronizationMode:        config.SynchronizationMode,
 	}
 }

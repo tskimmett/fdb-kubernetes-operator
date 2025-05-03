@@ -36,8 +36,8 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/e2e/fixtures"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/e2e/fixtures"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -216,18 +216,23 @@ var _ = Describe("Operator Upgrades", Label("e2e", "pr"), func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			// Check if the restarted process is showing up in IncompatibleConnections list in status output.
-			Eventually(func(g Gomega) bool {
+			Eventually(func(g Gomega) map[string]fdbv1beta2.None {
 				status := fdbCluster.GetStatus()
 				if len(status.Cluster.IncompatibleConnections) == 0 {
-					return false
+					return nil
 				}
 
 				log.Println("IncompatibleProcesses:", status.Cluster.IncompatibleConnections)
-				g.Expect(status.Cluster.IncompatibleConnections).To(HaveLen(1))
-				// Extract the IP of the incompatible process.
-				incompatibleProcess := strings.Split(status.Cluster.IncompatibleConnections[0], ":")[0]
-				return incompatibleProcess == selectedCoordinator.Status.PodIP
-			}).WithTimeout(180 * time.Second).WithPolling(4 * time.Second).Should(BeTrue())
+				result := make(map[string]fdbv1beta2.None)
+				// Ensure that all reported incompatible connections are from the selectedCoordinator.
+				for _, incompatibleConnection := range status.Cluster.IncompatibleConnections {
+					parsedAddr, err := fdbv1beta2.ParseProcessAddress(incompatibleConnection)
+					g.Expect(err).NotTo(HaveOccurred())
+					result[parsedAddr.MachineAddress()] = fdbv1beta2.None{}
+				}
+
+				return result
+			}).WithTimeout(180 * time.Second).WithPolling(4 * time.Second).Should(And(HaveLen(1), HaveKey(selectedCoordinator.Status.PodIP)))
 
 			// Allow the operator to restart processes and the upgrade should continue and finish.
 			fdbCluster.SetKillProcesses(true)
@@ -554,8 +559,15 @@ var _ = Describe("Operator Upgrades", Label("e2e", "pr"), func() {
 			factory.SetFinalizerForPod(&podMarkedForRemoval, []string{"foundationdb.org/test"})
 			// Don't wait for reconciliation as the cluster will never reconcile.
 			fdbCluster.ReplacePod(podMarkedForRemoval, false)
+
+			timeSinceLastForceReconcile := time.Now()
 			// Make sure the process group is marked for removal
 			Eventually(func() *int64 {
+				if time.Since(timeSinceLastForceReconcile) > 1*time.Minute {
+					fdbCluster.ForceReconcile()
+					timeSinceLastForceReconcile = time.Now()
+				}
+
 				cluster := fdbCluster.GetCluster()
 
 				for _, processGroup := range cluster.Status.ProcessGroups {

@@ -26,21 +26,24 @@ import (
 	"net"
 	"time"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal/coordinator"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbstatus"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal/coordination"
+
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal/coordinator"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbstatus"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 )
 
-// ignoreMissingProcessDuration defines the duration a Process Group must have the MissingProcess condition to be
-// ignored in the exclusion check and let the exclusions potentially move forward.
-// We should consider to make this configurable in the long term.
-const ignoreMissingProcessDuration = 5 * time.Minute
-
 // excludeProcesses provides a reconciliation step for excluding processes from
 // the database.
 type excludeProcesses struct{}
+
+// excludeEntry represents an entry for a process group that should be excluded and all the associated addresses.
+type excludeEntry struct {
+	processGroupID fdbv1beta2.ProcessGroupID
+	addresses      []fdbv1beta2.ProcessAddress
+}
 
 // reconcile runs the reconciler's work.
 func (e excludeProcesses) reconcile(ctx context.Context, r *FoundationDBClusterReconciler, cluster *fdbv1beta2.FoundationDBCluster, status *fdbv1beta2.FoundationDBStatus, logger logr.Logger) *requeue {
@@ -48,7 +51,9 @@ func (e excludeProcesses) reconcile(ctx context.Context, r *FoundationDBClusterR
 	if err != nil {
 		return &requeue{curError: err}
 	}
-	defer adminClient.Close()
+	defer func() {
+		_ = adminClient.Close()
+	}()
 
 	adminClient.WithValues()
 	// If the status is not cached, we have to fetch it.
@@ -64,21 +69,24 @@ func (e excludeProcesses) reconcile(ctx context.Context, r *FoundationDBClusterR
 		return &requeue{curError: err, delayedRequeue: true}
 	}
 	logger.Info("current exclusions", "exclusions", exclusions)
-	fdbProcessesToExcludeByClass, ongoingExclusionsByClass := getProcessesToExclude(exclusions, cluster)
+	pendingExclusions := map[fdbv1beta2.ProcessGroupID]time.Time{}
+	updatePendingExclusions := map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction{}
+	if cluster.GetSynchronizationMode() == fdbv1beta2.SynchronizationModeGlobal {
+		pendingExclusions, err = adminClient.GetPendingForExclusion(cluster.Spec.ProcessGroupIDPrefix)
+		if err != nil {
+			return &requeue{curError: err, delayedRequeue: true}
+		}
+	}
+
+	fdbProcessesToExcludeByClass, ongoingExclusionsByClass := getProcessesToExclude(exclusions, cluster, pendingExclusions, updatePendingExclusions)
 
 	// No processes have to be excluded we can directly return.
 	if len(fdbProcessesToExcludeByClass) == 0 {
 		return nil
 	}
 
-	// Make sure the exclusions are coordinated across multiple operator instances.
-	if cluster.ShouldUseLocks() {
-		lockClient, err := r.getLockClient(logger, cluster)
-		if err != nil {
-			return &requeue{curError: err}
-		}
-
-		_, err = lockClient.TakeLock()
+	if cluster.GetSynchronizationMode() == fdbv1beta2.SynchronizationModeGlobal {
+		err := adminClient.UpdatePendingForExclusion(updatePendingExclusions)
 		if err != nil {
 			return &requeue{curError: err, delayedRequeue: true}
 		}
@@ -113,6 +121,14 @@ func (e excludeProcesses) reconcile(ctx context.Context, r *FoundationDBClusterR
 		return &requeue{curError: err, delayedRequeue: true}
 	}
 
+	readyExclusions := map[fdbv1beta2.ProcessGroupID]time.Time{}
+	updateReadyExclusions := map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction{}
+	if cluster.GetSynchronizationMode() == fdbv1beta2.SynchronizationModeGlobal {
+		readyExclusions, err = adminClient.GetReadyForExclusion(cluster.Spec.ProcessGroupIDPrefix)
+		if err != nil {
+			return &requeue{curError: err, delayedRequeue: true}
+		}
+	}
 	// transactionSystemExclusionAllowed will keep track if the exclusion is allowed and if the operator is allowed to
 	// exclude processes from the transaction system. If multiple processes from different processes classes that are part
 	// of the transaction system should be excluded, the operator will expect that the exclusion is allowed for all
@@ -120,6 +136,7 @@ func (e excludeProcesses) reconcile(ctx context.Context, r *FoundationDBClusterR
 	// migrations as the stateless pods are often created much faster than the log pod as the stateless pods don't have
 	// to wait for the storage provisioning.
 	transactionSystemExclusionAllowed := true
+	allProcessesExcluded := true
 	desiredProcessesMap := desiredProcesses.Map()
 	for processClass := range fdbProcessesToExcludeByClass {
 		contextLogger := logger.WithValues("processClass", processClass)
@@ -127,17 +144,18 @@ func (e excludeProcesses) reconcile(ctx context.Context, r *FoundationDBClusterR
 		processesToExclude := fdbProcessesToExcludeByClass[processClass]
 
 		allowedExclusions, missingProcesses := getAllowedExclusionsAndMissingProcesses(contextLogger, cluster, processClass, desiredProcessesMap[processClass], ongoingExclusions, r.InSimulation)
-		// TODO (johscheuer): Should we also batch exclusions for storage servers? Those should be rare compared to replacements in the transaction system.
 		if allowedExclusions <= 0 {
 			if processClass.IsTransaction() {
 				transactionSystemExclusionAllowed = false
 			}
 			contextLogger.Info("Waiting for missing processes before continuing with the exclusion", "missingProcesses", missingProcesses, "addressesToExclude", processesToExclude, "allowedExclusions", allowedExclusions, "ongoingExclusions", ongoingExclusions)
+			allProcessesExcluded = false
 			continue
 		}
 
 		// If we are not able to exclude all processes at once print a log message.
 		if len(processesToExclude) > allowedExclusions {
+			allProcessesExcluded = false
 			contextLogger.Info("Some processes are still missing but continuing with the exclusion", "missingProcesses", missingProcesses, "addressesToExclude", processesToExclude, "allowedExclusions", allowedExclusions, "ongoingExclusions", ongoingExclusions)
 		}
 
@@ -145,12 +163,17 @@ func (e excludeProcesses) reconcile(ctx context.Context, r *FoundationDBClusterR
 			allowedExclusions = len(processesToExclude)
 		}
 
-		// TODO (johscheuer): As a next step we could exclude transaction (log + stateless) processes together and exclude
-		// storage processes with a separate call. This would make sure that no storage checks will block
-		// the exclusion of transaction processes.
-
-		// Add as many processes as allowed to the exclusion list.
-		fdbProcessesToExclude = append(fdbProcessesToExclude, processesToExclude[:allowedExclusions]...)
+		// Add as many processes as allowed to the exclusion list. The allowedExclusions reflects the count of processes
+		// that can be excluded, that could also be multiple addresses.
+		var exclusionIdx int
+		for exclusionIdx < allowedExclusions {
+			entry := processesToExclude[exclusionIdx]
+			if _, ok := readyExclusions[entry.processGroupID]; !ok {
+				updateReadyExclusions[entry.processGroupID] = fdbv1beta2.UpdateActionAdd
+			}
+			fdbProcessesToExclude = append(fdbProcessesToExclude, entry.addresses...)
+			exclusionIdx++
+		}
 	}
 
 	if len(fdbProcessesToExclude) == 0 {
@@ -169,6 +192,62 @@ func (e excludeProcesses) reconcile(ctx context.Context, r *FoundationDBClusterR
 		}
 	}
 
+	// Update the ready for exclusion entries if some are ready.
+	if cluster.GetSynchronizationMode() == fdbv1beta2.SynchronizationModeGlobal {
+		err = adminClient.UpdateReadyForExclusion(updateReadyExclusions)
+		if err != nil {
+			return &requeue{curError: err, delayedRequeue: true}
+		}
+	}
+
+	// Make sure the exclusions are coordinated across multiple operator instances.
+	err = r.takeLock(logger, cluster, "exclude processes")
+	if err != nil {
+		return &requeue{curError: err, delayedRequeue: true}
+	}
+
+	// In case of the global synchronization mode we have to perform some additional checks.
+	if cluster.GetSynchronizationMode() == fdbv1beta2.SynchronizationModeGlobal {
+		// Fetching all pending exclusions.
+		pendingExclusions, err = adminClient.GetPendingForExclusion("")
+		if err != nil {
+			return &requeue{curError: err, delayedRequeue: true}
+		}
+
+		// Fetching all ready for exclusions.
+		readyExclusions, err = adminClient.GetReadyForExclusion("")
+		if err != nil {
+			return &requeue{curError: err, delayedRequeue: true}
+		}
+
+		// Check if all processes can be excluded, or if only a subset of processes can be excluded.
+		var allowedExclusions map[fdbv1beta2.ProcessGroupID]time.Time
+		allowedExclusions, err = coordination.AllProcessesReadyForExclusion(logger, pendingExclusions, readyExclusions, r.GlobalSynchronizationWaitDuration)
+		if err != nil {
+			return &requeue{curError: err, delayedRequeue: true}
+		}
+
+		if len(allowedExclusions) != len(readyExclusions) {
+			allProcessesExcluded = false
+		}
+
+		// Convert all the process groups that should be excluded to the right addresses based on the cluster status.
+		fdbProcessesToExclude = coordination.GetAddressesFromStatus(logger, status, allowedExclusions, cluster.UseLocalitiesForExclusion())
+	}
+
+	r.Recorder.Event(cluster, corev1.EventTypeNormal, "ExcludingProcesses", fmt.Sprintf("Excluding %v", fdbProcessesToExclude))
+	// We use the no_wait exclusion here to trigger the exclusion without waiting for the data movement to complete.
+	// There is no need to wait for the data movement to complete in this call as later calls will verify that the
+	// data is moved and the processes are fully excluded. Using the no_wait flag here will reduce the timeout errors
+	// as those are hit most of the time if at least one storage process is included in the exclusion list.
+	err = adminClient.ExcludeProcessesWithNoWait(fdbProcessesToExclude, true)
+	// Reset the SecondsSinceLastRecovered since the operator just excluded some processes, which will cause a recovery.
+	status.Cluster.RecoveryState.SecondsSinceLastRecovered = 0.0
+	// If the exclusion failed, we don't want to change the coordinators and delay the coordinators change to a later time.
+	if err != nil {
+		return &requeue{curError: err, delayedRequeue: true}
+	}
+
 	var coordinatorExcluded bool
 	for _, excludeProcess := range fdbProcessesToExclude {
 		excludeString := excludeProcess.String()
@@ -181,25 +260,11 @@ func (e excludeProcesses) reconcile(ctx context.Context, r *FoundationDBClusterR
 		}
 	}
 
-	var coordinatorErr error
-	// If a coordinator should be excluded, we will change the coordinators before doing the exclusion. This should reduce the
-	// observed recoveries, see: https://github.com/FoundationDB/fdb-kubernetes-operator/issues/2018.
-	if coordinatorExcluded {
-		coordinatorErr = coordinator.ChangeCoordinators(logger, adminClient, cluster, status)
-	}
-
-	r.Recorder.Event(cluster, corev1.EventTypeNormal, "ExcludingProcesses", fmt.Sprintf("Excluding %v", fdbProcessesToExclude))
-	// We use the no_wait exclusion here to trigger the exclusion without waiting for the data movement to complete.
-	// There is no need to wait for the data movement to complete in this call as later calls will verify that the
-	// data is moved and the processes are fully excluded. Using the no_wait flag here will reduce the timeout errors
-	// as those are hit most of the time if at least one storage process is included in the exclusion list.
-	err = adminClient.ExcludeProcessesWithNoWait(fdbProcessesToExclude, true)
-	if err != nil {
-		return &requeue{curError: err, delayedRequeue: true}
-	}
-
 	// Only if a coordinator was excluded we have to check for an error and update the cluster.
 	if coordinatorExcluded {
+		// If a coordinator should be excluded, we will change the coordinators directly after the exclusion.
+		// This should reduce the observed recoveries, see: https://github.com/FoundationDB/fdb-kubernetes-operator/v2/issues/2018.
+		coordinatorErr := coordinator.ChangeCoordinators(logger, adminClient, cluster, status)
 		if coordinatorErr != nil {
 			return &requeue{curError: coordinatorErr, delayedRequeue: true}
 		}
@@ -210,14 +275,16 @@ func (e excludeProcesses) reconcile(ctx context.Context, r *FoundationDBClusterR
 		}
 	}
 
-	// Reset the SecondsSinceLastRecovered since the operator just excluded some processes, which will cause a recovery.
-	status.Cluster.RecoveryState.SecondsSinceLastRecovered = 0.0
+	// If not all processes are excluded, ensure we requeue after 5 minutes.
+	if !allProcessesExcluded {
+		return &requeue{message: "Additional processes must be excluded", delay: 5 * time.Minute, delayedRequeue: true}
+	}
 
 	return nil
 }
 
-func getProcessesToExclude(exclusions []fdbv1beta2.ProcessAddress, cluster *fdbv1beta2.FoundationDBCluster) (map[fdbv1beta2.ProcessClass][]fdbv1beta2.ProcessAddress, map[fdbv1beta2.ProcessClass]int) {
-	fdbProcessesToExcludeByClass := make(map[fdbv1beta2.ProcessClass][]fdbv1beta2.ProcessAddress)
+func getProcessesToExclude(exclusions []fdbv1beta2.ProcessAddress, cluster *fdbv1beta2.FoundationDBCluster, pendingExclusions map[fdbv1beta2.ProcessGroupID]time.Time, updatePendingExclusions map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) (map[fdbv1beta2.ProcessClass][]excludeEntry, map[fdbv1beta2.ProcessClass]int) {
+	fdbProcessesToExcludeByClass := make(map[fdbv1beta2.ProcessClass][]excludeEntry)
 	// This map keeps track on how many processes are currently excluded but haven't finished the exclusion yet.
 	ongoingExclusionsByClass := make(map[fdbv1beta2.ProcessClass]int)
 
@@ -247,19 +314,48 @@ func getProcessesToExclude(exclusions []fdbv1beta2.ProcessAddress, cluster *fdbv
 			continue
 		}
 
+		if _, ok := pendingExclusions[processGroup.ProcessGroupID]; !ok {
+			updatePendingExclusions[processGroup.ProcessGroupID] = fdbv1beta2.UpdateActionAdd
+		}
+
 		// We are excluding process here using the locality field. It might be possible that the process was already excluded using IP before
 		// but for the sake of consistency it is better to exclude process using locality as well.
 		if cluster.UseLocalitiesForExclusion() {
-			if len(fdbProcessesToExcludeByClass[processGroup.ProcessClass]) == 0 {
-				fdbProcessesToExcludeByClass[processGroup.ProcessClass] = []fdbv1beta2.ProcessAddress{{StringAddress: processGroup.GetExclusionString()}}
+			// Already excluded, so we don't have to exclude it again.
+			if _, ok := currentExclusionMap[processGroup.GetExclusionString()]; ok {
 				continue
 			}
 
-			fdbProcessesToExcludeByClass[processGroup.ProcessClass] = append(fdbProcessesToExcludeByClass[processGroup.ProcessClass], fdbv1beta2.ProcessAddress{StringAddress: processGroup.GetExclusionString()})
+			if len(fdbProcessesToExcludeByClass[processGroup.ProcessClass]) == 0 {
+				fdbProcessesToExcludeByClass[processGroup.ProcessClass] = append(fdbProcessesToExcludeByClass[processGroup.ProcessClass],
+					excludeEntry{
+						processGroupID: processGroup.ProcessGroupID,
+						addresses: []fdbv1beta2.ProcessAddress{
+							{StringAddress: processGroup.GetExclusionString()},
+						},
+					},
+				)
+				continue
+			}
+
+			fdbProcessesToExcludeByClass[processGroup.ProcessClass] = append(fdbProcessesToExcludeByClass[processGroup.ProcessClass],
+				excludeEntry{
+					processGroupID: processGroup.ProcessGroupID,
+					addresses: []fdbv1beta2.ProcessAddress{
+						{StringAddress: processGroup.GetExclusionString()},
+					},
+				},
+			)
 			continue
 		}
 
 		allAddressesExcluded := true
+		entry := excludeEntry{
+			processGroupID: processGroup.ProcessGroupID,
+			addresses:      []fdbv1beta2.ProcessAddress{},
+		}
+
+		var addresses []fdbv1beta2.ProcessAddress
 		for _, address := range processGroup.Addresses {
 			// Already excluded, so we don't have to exclude it again.
 			if _, ok := currentExclusionMap[address]; ok {
@@ -267,15 +363,15 @@ func getProcessesToExclude(exclusions []fdbv1beta2.ProcessAddress, cluster *fdbv
 			}
 
 			allAddressesExcluded = false
-			if len(fdbProcessesToExcludeByClass[processGroup.ProcessClass]) == 0 {
-				fdbProcessesToExcludeByClass[processGroup.ProcessClass] = []fdbv1beta2.ProcessAddress{{IPAddress: net.ParseIP(address)}}
-				continue
-			}
-
-			fdbProcessesToExcludeByClass[processGroup.ProcessClass] = append(fdbProcessesToExcludeByClass[processGroup.ProcessClass], fdbv1beta2.ProcessAddress{IPAddress: net.ParseIP(address)})
+			addresses = append(addresses, fdbv1beta2.ProcessAddress{IPAddress: net.ParseIP(address)})
 		}
 
-		// Only if all known addresses are excluded we assume this is an ongoing exclusion. Otherwise it might be that
+		if len(addresses) > 0 {
+			entry.addresses = addresses
+			fdbProcessesToExcludeByClass[processGroup.ProcessClass] = append(fdbProcessesToExcludeByClass[processGroup.ProcessClass], entry)
+		}
+
+		// Only if all known addresses are excluded we assume this is an ongoing exclusion. Otherwise, it might be that
 		// the Pod was recreated and got a new IP address assigned.
 		if allAddressesExcluded {
 			ongoingExclusionsByClass[processGroup.ProcessClass]++
@@ -313,7 +409,7 @@ func getAllowedExclusionsAndMissingProcesses(logger logr.Logger, cluster *fdbv1b
 			missingProcesses = append(missingProcesses, processGroup.ProcessGroupID)
 			logger.V(1).Info("Missing processes", "processGroupID", processGroup.ProcessGroupID, "missingTime", missingTime.String())
 
-			if time.Since(missingTime) < ignoreMissingProcessDuration {
+			if time.Since(missingTime) < coordination.IgnoreMissingProcessDuration {
 				exclusionsAllowed = false
 			}
 			continue

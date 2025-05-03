@@ -24,7 +24,7 @@ import (
 	"context"
 	"strings"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 )
 
 // startRestore provides a reconciliation step for starting a new restore.
@@ -37,13 +37,16 @@ func (s startRestore) reconcile(ctx context.Context, r *FoundationDBRestoreRecon
 	if err != nil {
 		return &requeue{curError: err}
 	}
-	defer adminClient.Close()
+	defer func() {
+		_ = adminClient.Close()
+	}()
 
 	status, err := adminClient.GetRestoreStatus()
 	if err != nil {
 		return &requeue{curError: err}
 	}
 
+	// TODO (johscheuer): Make use of the status.state setting to see if the restore was started.
 	if len(strings.TrimSpace(status)) == 0 {
 		err = adminClient.StartRestore(restore.BackupURL(), restore.Spec.KeyRanges)
 		if err != nil {
@@ -55,6 +58,8 @@ func (s startRestore) reconcile(ctx context.Context, r *FoundationDBRestoreRecon
 		if err != nil {
 			return &requeue{curError: err}
 		}
+
+		return nil
 	}
 
 	return nil

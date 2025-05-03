@@ -34,17 +34,17 @@ import (
 	"sync"
 	"time"
 
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/e2e/fixtures"
+	chaosmesh "github.com/chaos-mesh/chaos-mesh/api/v1alpha1"
 	"golang.org/x/sync/errgroup"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sTypes "k8s.io/apimachinery/pkg/types"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/e2e/fixtures"
-	chaosmesh "github.com/chaos-mesh/chaos-mesh/api/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	corev1 "k8s.io/api/core/v1"
-	k8sTypes "k8s.io/apimachinery/pkg/types"
 )
 
 func init() {
@@ -56,12 +56,6 @@ var (
 	fdbCluster  *fixtures.HaFdbCluster
 	testOptions *fixtures.FactoryOptions
 )
-
-var _ = AfterSuite(func() {
-	if CurrentSpecReport().Failed() {
-		log.Printf("failed due to %s", CurrentSpecReport().FailureMessage())
-	}
-})
 
 type testConfig struct {
 	beforeVersion          string
@@ -139,6 +133,12 @@ func verifyBouncingIsBlocked() {
 	}).WithTimeout(10 * time.Minute).WithPolling(5 * time.Second).MustPassRepeatedly(30).Should(BeTrue())
 }
 
+var _ = AfterSuite(func() {
+	if CurrentSpecReport().Failed() {
+		log.Printf("failed due to %s", CurrentSpecReport().FailureMessage())
+	}
+})
+
 var _ = Describe("Operator HA Upgrades", Label("e2e", "pr"), func() {
 	BeforeEach(func() {
 		factory = fixtures.CreateFactory(testOptions)
@@ -159,16 +159,8 @@ var _ = Describe("Operator HA Upgrades", Label("e2e", "pr"), func() {
 		func(beforeVersion string, targetVersion string) {
 			clusterSetup(beforeVersion, false)
 
-			// Upgrade the cluster and then verify that the processes have upgraded to "targetVersion".
-			startTime := time.Now()
 			Expect(fdbCluster.UpgradeCluster(targetVersion, true)).NotTo(HaveOccurred())
 			fdbCluster.VerifyVersion(targetVersion)
-			log.Println(
-				"Multi-DC cluster upgraded to version",
-				targetVersion,
-				"in minutes",
-				time.Since(startTime).Minutes(),
-			)
 		},
 		EntryDescription("Upgrade from %s to %s"),
 		fixtures.GenerateUpgradeTableEntries(testOptions),
@@ -198,6 +190,7 @@ var _ = Describe("Operator HA Upgrades", Label("e2e", "pr"), func() {
 				}
 			}
 
+			startTime := time.Now()
 			// Start the upgrade for the whole cluster
 			Expect(fdbCluster.UpgradeCluster(targetVersion, false)).NotTo(HaveOccurred())
 
@@ -257,7 +250,7 @@ var _ = Describe("Operator HA Upgrades", Label("e2e", "pr"), func() {
 			Expect(processCounts).To(BeNumerically("<=", expectedProcessCounts))
 
 			finalGeneration := fdbCluster.GetPrimary().GetStatus().Cluster.Generation
-			log.Println("initialGeneration:", initialGeneration, "finalGeneration", finalGeneration, "gap", finalGeneration-initialGeneration)
+			log.Println("upgrade took:", time.Since(startTime).String(), "initialGeneration:", initialGeneration, "finalGeneration", finalGeneration, "gap", finalGeneration-initialGeneration, "recoveryCount", (finalGeneration-initialGeneration)/2)
 
 			// Verify that the cluster generation number didn't increase by more
 			// than 80 (in an ideal case the number of recoveries that should happen
@@ -494,7 +487,10 @@ var _ = Describe("Operator HA Upgrades", Label("e2e", "pr"), func() {
 		fixtures.GenerateUpgradeTableEntries(testOptions),
 	)
 
-	DescribeTable(
+	// TODO (johscheuer): Ensure this test passes reliably. Right now the cluster sometimes gets stuck and needs
+	// manual intervention.
+	// See: https://github.com/FoundationDB/fdb-kubernetes-operator/v2/issues/2196
+	PDescribeTable(
 		"when no remote storage processes are restarted",
 		func(beforeVersion string, targetVersion string) {
 			// We disable the health check here, as the remote storage processes are not restarted and this can be
@@ -554,7 +550,6 @@ var _ = Describe("Operator HA Upgrades", Label("e2e", "pr"), func() {
 			}
 
 			clusterConfig := fixtures.DefaultClusterConfigWithHaMode(fixtures.HaFourZoneSingleSat, false)
-			clusterConfig.UseLocalityBasedExclusions = true
 
 			clusterSetupWithTestConfig(
 				testConfig{

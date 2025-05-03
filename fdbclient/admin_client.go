@@ -27,8 +27,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbstatus"
-	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"os"
 	"os/exec"
 	"path"
@@ -37,11 +35,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbstatus"
+	"github.com/apple/foundationdb/bindings/go/src/fdb"
+
 	"github.com/go-logr/logr"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbadminclient"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbadminclient"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -72,10 +73,6 @@ type cliAdminClient struct {
 	// Cluster is the reference to the cluster model.
 	Cluster *fdbv1beta2.FoundationDBCluster
 
-	// clusterFilePath is the path to the temp file containing the cluster file
-	// for this session.
-	clusterFilePath string
-
 	// custom parameters that should be set.
 	knobs []string
 
@@ -96,16 +93,10 @@ type cliAdminClient struct {
 
 // NewCliAdminClient generates an Admin client for a cluster
 func NewCliAdminClient(cluster *fdbv1beta2.FoundationDBCluster, _ client.Client, logger logr.Logger) (fdbadminclient.AdminClient, error) {
-	clusterFile, err := createClusterFile(cluster)
-	if err != nil {
-		return nil, err
-	}
-
 	return &cliAdminClient{
-		Cluster:         cluster,
-		clusterFilePath: clusterFile,
-		log:             logger,
-		cmdRunner:       &realCommandRunner{log: logger},
+		Cluster:   cluster,
+		log:       logger,
+		cmdRunner: &realCommandRunner{log: logger},
 		fdbLibClient: &realFdbLibClient{
 			cluster: cluster,
 			logger:  logger,
@@ -195,7 +186,7 @@ func getBinaryPath(binaryName string, version string) string {
 	return path.Join(os.Getenv("FDB_BINARY_DIR"), parsed.GetBinaryVersion(), binaryName)
 }
 
-func (client *cliAdminClient) getArgsAndTimeout(command cliCommand) ([]string, time.Duration) {
+func (client *cliAdminClient) getArgsAndTimeout(command cliCommand, clusterFile string) ([]string, time.Duration) {
 	args := make([]string, len(command.args))
 	copy(args, command.args)
 	if len(args) == 0 {
@@ -204,7 +195,7 @@ func (client *cliAdminClient) getArgsAndTimeout(command cliCommand) ([]string, t
 
 	// If we want to print out the version we don't have to pass the cluster file path
 	if len(args) == 0 || args[0] != "--version" {
-		args = append(args, command.getClusterFileFlag(), client.clusterFilePath)
+		args = append(args, command.getClusterFileFlag(), clusterFile)
 	}
 
 	// We only want to pass the knobs to fdbbackup and fdbrestore
@@ -239,7 +230,16 @@ func (client *cliAdminClient) getArgsAndTimeout(command cliCommand) ([]string, t
 
 // runCommand executes a command in the CLI.
 func (client *cliAdminClient) runCommand(command cliCommand) (string, error) {
-	args, hardTimeout := client.getArgsAndTimeout(command)
+	clusterFile, err := createClusterFileForCommandLine(client.Cluster)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = clusterFile.Close()
+		_ = os.Remove(clusterFile.Name())
+	}()
+
+	args, hardTimeout := client.getArgsAndTimeout(command, clusterFile.Name())
 	timeoutContext, cancelFunction := context.WithTimeout(context.Background(), hardTimeout)
 	defer cancelFunction()
 
@@ -332,8 +332,8 @@ func (client *cliAdminClient) GetStatus() (*fdbv1beta2.FoundationDBStatus, error
 }
 
 // ConfigureDatabase sets the database configuration
-func (client *cliAdminClient) ConfigureDatabase(configuration fdbv1beta2.DatabaseConfiguration, newDatabase bool, version string) error {
-	configurationString, err := configuration.GetConfigurationString(version)
+func (client *cliAdminClient) ConfigureDatabase(configuration fdbv1beta2.DatabaseConfiguration, newDatabase bool) error {
+	configurationString, err := configuration.GetConfigurationString()
 	if err != nil {
 		return err
 	}
@@ -387,20 +387,15 @@ func (client *cliAdminClient) ExcludeProcessesWithNoWait(addresses []fdbv1beta2.
 		return nil
 	}
 
-	version, err := fdbv1beta2.ParseFdbVersion(client.Cluster.Spec.Version)
-	if err != nil {
-		return err
-	}
-
 	var excludeCommand strings.Builder
 	excludeCommand.WriteString("exclude ")
-	if version.HasNonBlockingExcludes(noWait) {
+	if noWait {
 		excludeCommand.WriteString("no_wait ")
 	}
 
 	excludeCommand.WriteString(fdbv1beta2.ProcessAddressesString(addresses, " "))
 
-	_, err = client.runCommand(cliCommand{command: excludeCommand.String(), timeout: client.getTimeout()})
+	_, err := client.runCommand(cliCommand{command: excludeCommand.String(), timeout: client.getTimeout()})
 
 	return err
 }
@@ -491,16 +486,7 @@ func (client *cliAdminClient) ChangeCoordinators(addresses []fdbv1beta2.ProcessA
 		return "", err
 	}
 
-	connectionStringBytes, err := os.ReadFile(client.clusterFilePath)
-	if err != nil {
-		return "", err
-	}
-
-	connectionString, err := fdbv1beta2.ParseConnectionString(string(connectionStringBytes))
-	if err != nil {
-		return "", err
-	}
-	return connectionString.String(), nil
+	return getConnectionStringFromDB(client.fdbLibClient, client.getTimeout())
 }
 
 // cleanConnectionStringOutput is a helper method to remove unrelated output from the get command in the connection string
@@ -517,15 +503,13 @@ func cleanConnectionStringOutput(input string) string {
 
 // GetConnectionString fetches the latest connection string.
 func (client *cliAdminClient) GetConnectionString() (string, error) {
-	// This will call directly the database and fetch the connection string
-	// from the system key space.
-	outputBytes, err := getConnectionStringFromDB(client.fdbLibClient, client.getTimeout())
-
+	output, err := client.runCommand(cliCommand{command: "option on ACCESS_SYSTEM_KEYS; get \\xff/coordinators"})
 	if err != nil {
 		return "", err
 	}
+
 	var connectionString fdbv1beta2.ConnectionString
-	connectionString, err = fdbv1beta2.ParseConnectionString(cleanConnectionStringOutput(string(outputBytes)))
+	connectionString, err = fdbv1beta2.ParseConnectionString(cleanConnectionStringOutput(output))
 	if err != nil {
 		return "", err
 	}
@@ -889,4 +873,89 @@ func quorumOfCoordinatorsAreReachable(status *fdbv1beta2.FoundationDBStatus) boo
 	}
 
 	return status.Client.Coordinators.QuorumReachable
+}
+
+const (
+	pendingForRemoval   = "pendingForRemoval"
+	pendingForExclusion = "pendingForExclusion"
+	pendingForInclusion = "pendingForInclusion"
+	pendingForRestart   = "pendingForRestart"
+	readyForExclusion   = "readyForExclusion"
+	readyForInclusion   = "readyForInclusion"
+	readyForRestart     = "readyForRestart"
+)
+
+// UpdatePendingForRemoval updates the set of process groups that are marked for removal, an update can be either the addition or removal of a process group.
+func (client *cliAdminClient) UpdatePendingForRemoval(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.fdbLibClient.updateGlobalCoordinationKeys(pendingForRemoval, updates)
+}
+
+// UpdatePendingForExclusion updates the set of process groups that should be excluded, an update can be either the addition or removal of a process group.
+func (client *cliAdminClient) UpdatePendingForExclusion(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.fdbLibClient.updateGlobalCoordinationKeys(pendingForExclusion, updates)
+}
+
+// UpdatePendingForInclusion updates the set of process groups that should be included, an update can be either the addition or removal of a process group.
+func (client *cliAdminClient) UpdatePendingForInclusion(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.fdbLibClient.updateGlobalCoordinationKeys(pendingForInclusion, updates)
+}
+
+// UpdatePendingForRestart updates the set of process groups that should be restarted, an update can be either the addition or removal of a process group.
+func (client *cliAdminClient) UpdatePendingForRestart(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.fdbLibClient.updateGlobalCoordinationKeys(pendingForRestart, updates)
+}
+
+// UpdateReadyForExclusion updates the set of process groups that are ready to be excluded, an update can be either the addition or removal of a process group.
+func (client *cliAdminClient) UpdateReadyForExclusion(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.fdbLibClient.updateGlobalCoordinationKeys(readyForExclusion, updates)
+}
+
+// UpdateReadyForInclusion updates the set of process groups that are ready to be included, an update can be either the addition or removal of a process group.
+func (client *cliAdminClient) UpdateReadyForInclusion(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.fdbLibClient.updateGlobalCoordinationKeys(readyForInclusion, updates)
+}
+
+// UpdateReadyForRestart updates the set of process groups that are ready to be restarted, an update can be either the addition or removal of a process group
+func (client *cliAdminClient) UpdateReadyForRestart(updates map[fdbv1beta2.ProcessGroupID]fdbv1beta2.UpdateAction) error {
+	return client.fdbLibClient.updateGlobalCoordinationKeys(readyForRestart, updates)
+}
+
+// GetPendingForRemoval gets the process group IDs for all process groups that are marked for removal.
+func (client *cliAdminClient) GetPendingForRemoval(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.fdbLibClient.getGlobalCoordinationKeys(path.Join(pendingForRemoval, prefix))
+}
+
+// GetPendingForExclusion gets the process group IDs for all process groups that should be excluded.
+func (client *cliAdminClient) GetPendingForExclusion(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.fdbLibClient.getGlobalCoordinationKeys(path.Join(pendingForExclusion, prefix))
+}
+
+// GetPendingForInclusion gets the process group IDs for all the process groups that should be included.
+func (client *cliAdminClient) GetPendingForInclusion(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.fdbLibClient.getGlobalCoordinationKeys(path.Join(pendingForInclusion, prefix))
+}
+
+// GetPendingForRestart gets the process group IDs for all the process groups that should be restarted.
+func (client *cliAdminClient) GetPendingForRestart(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.fdbLibClient.getGlobalCoordinationKeys(path.Join(pendingForRestart, prefix))
+}
+
+// GetReadyForExclusion gets the process group IDs for all the process groups that are ready to be excluded.
+func (client *cliAdminClient) GetReadyForExclusion(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.fdbLibClient.getGlobalCoordinationKeys(path.Join(readyForExclusion, prefix))
+}
+
+// GetReadyForInclusion gets the process group IDs for all the process groups that are ready to be included.
+func (client *cliAdminClient) GetReadyForInclusion(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.fdbLibClient.getGlobalCoordinationKeys(path.Join(readyForInclusion, prefix))
+}
+
+// GetReadyForRestart gets the process group IDs fir all the process groups that are ready to be restarted.
+func (client *cliAdminClient) GetReadyForRestart(prefix string) (map[fdbv1beta2.ProcessGroupID]time.Time, error) {
+	return client.fdbLibClient.getGlobalCoordinationKeys(path.Join(readyForRestart, prefix))
+}
+
+// ClearReadyForRestart removes all the process group IDs for all the process groups that are ready to be restarted.
+func (client *cliAdminClient) ClearReadyForRestart() error {
+	return client.fdbLibClient.clearGlobalCoordinationKeys(readyForRestart)
 }

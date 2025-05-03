@@ -21,12 +21,12 @@
 package mock
 
 import (
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 )
 
 var _ = Describe("lock_client_test", func() {
@@ -40,9 +40,7 @@ var _ = Describe("lock_client_test", func() {
 
 	Describe("TakeLock", func() {
 		It("returns true", func() {
-			success, err := lockClient.TakeLock()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(success).To(BeTrue())
+			Expect(lockClient.TakeLock()).To(Succeed())
 		})
 	})
 

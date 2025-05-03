@@ -25,7 +25,7 @@ import (
 	"strconv"
 	"strings"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -73,10 +73,9 @@ func generateServicePorts(processesPerPod int) []corev1.ServicePort {
 
 // GetService builds a service for a new process group
 func GetService(cluster *fdbv1beta2.FoundationDBCluster, processGroup *fdbv1beta2.ProcessGroupStatus) (*corev1.Service, error) {
-	owner := BuildOwnerReference(cluster.TypeMeta, cluster.ObjectMeta)
 	metadata := GetObjectMetadata(cluster, nil, processGroup.ProcessClass, processGroup.ProcessGroupID)
 	metadata.Name = processGroup.GetPodName(cluster)
-	metadata.OwnerReferences = owner
+	metadata.OwnerReferences = BuildOwnerReference(cluster.TypeMeta, cluster.ObjectMeta)
 
 	processesPerPod := 1
 	if processGroup.ProcessClass == fdbv1beta2.ProcessClassStorage {
@@ -302,9 +301,9 @@ func setAffinityForFaultDomain(cluster *fdbv1beta2.FoundationDBCluster, podSpec 
 	}
 }
 
-func configureVolumesForContainers(cluster *fdbv1beta2.FoundationDBCluster, podSpec *corev1.PodSpec, volumeClaimTemplate *corev1.PersistentVolumeClaim, podName string, processClass fdbv1beta2.ProcessClass) {
+func configureVolumesForContainers(cluster *fdbv1beta2.FoundationDBCluster, podSpec *corev1.PodSpec, processGroup *fdbv1beta2.ProcessGroupStatus) {
 	useUnifiedImage := cluster.UseUnifiedImage()
-	monitorConfKey := GetConfigMapMonitorConfEntry(processClass, cluster.DesiredImageType(), cluster.GetDesiredServersPerPod(processClass))
+	monitorConfKey := GetConfigMapMonitorConfEntry(processGroup.ProcessClass, cluster.DesiredImageType(), cluster.GetDesiredServersPerPod(processGroup.ProcessClass))
 
 	var monitorConfFile string
 	if useUnifiedImage {
@@ -322,23 +321,10 @@ func configureVolumesForContainers(cluster *fdbv1beta2.FoundationDBCluster, podS
 		configMapItems = append(configMapItems, corev1.KeyToPath{Key: fdbv1beta2.CaFileKey, Path: "ca.pem"})
 	}
 
-	var configMapRefName string
-	if cluster.Spec.ConfigMap != nil && cluster.Spec.ConfigMap.Name != "" {
-		configMapRefName = fmt.Sprintf("%s-%s", cluster.Name, cluster.Spec.ConfigMap.Name)
-	} else {
-		configMapRefName = fmt.Sprintf("%s-config", cluster.Name)
-	}
-
 	var mainVolumeSource corev1.VolumeSource
-	if processClass.IsStateful() {
-		var volumeClaimSourceName string
-		if volumeClaimTemplate != nil && volumeClaimTemplate.Name != "" {
-			volumeClaimSourceName = fmt.Sprintf("%s-%s", podName, volumeClaimTemplate.Name)
-		} else {
-			volumeClaimSourceName = fmt.Sprintf("%s-data", podName)
-		}
+	if processGroup.ProcessClass.IsStateful() {
 		mainVolumeSource.PersistentVolumeClaim = &corev1.PersistentVolumeClaimVolumeSource{
-			ClaimName: volumeClaimSourceName,
+			ClaimName: processGroup.GetPvcName(cluster),
 		}
 	} else {
 		mainVolumeSource.EmptyDir = &corev1.EmptyDirVolumeSource{}
@@ -355,8 +341,10 @@ func configureVolumesForContainers(cluster *fdbv1beta2.FoundationDBCluster, podS
 	}
 	volumes = append(volumes,
 		corev1.Volume{Name: "config-map", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-			LocalObjectReference: corev1.LocalObjectReference{Name: configMapRefName},
-			Items:                configMapItems,
+			LocalObjectReference: corev1.LocalObjectReference{
+				Name: getConfigMapName(cluster.Name),
+			},
+			Items: configMapItems,
 		}}},
 		corev1.Volume{Name: "fdb-trace-logs", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	)
@@ -478,12 +466,26 @@ func GetPodSpec(cluster *fdbv1beta2.FoundationDBCluster, processGroup *fdbv1beta
 	ensureSecurityContextIsPresent(mainContainer)
 	ensureSecurityContextIsPresent(sidecarContainer)
 	setAffinityForFaultDomain(cluster, podSpec, processGroup.ProcessClass)
-	configureVolumesForContainers(cluster, podSpec, processSettings.VolumeClaimTemplate, podName, processGroup.ProcessClass)
+	configureVolumesForContainers(cluster, podSpec, processGroup)
 	configureNoSchedule(podSpec, processGroup.ProcessGroupID, cluster.Spec.Buggify.NoSchedule)
 
-	if !useUnifiedImage {
+	if useUnifiedImage {
+		var writeIdx int
+		for _, container := range podSpec.InitContainers {
+			// Skip the init container for the unified image.
+			if container.Name == fdbv1beta2.InitContainerName {
+				continue
+			}
+
+			podSpec.InitContainers[writeIdx] = container
+			writeIdx++
+		}
+
+		podSpec.InitContainers = podSpec.InitContainers[:writeIdx]
+	} else {
 		replaceContainers(podSpec.InitContainers, initContainer)
 	}
+
 	replaceContainers(podSpec.Containers, mainContainer, sidecarContainer)
 
 	headlessService := GetHeadlessService(cluster)
@@ -542,11 +544,10 @@ func configureSidecarContainer(container *corev1.Container, initMode bool, proce
 		)
 
 		cluster := optionalCluster
-
-		if cluster.Spec.Routing.PodIPFamily != nil {
+		if cluster.GetPodIPFamily() != fdbv1beta2.PodIPFamilyUnset {
 			sidecarArgs = append(sidecarArgs, "--public-ip-family")
-			sidecarArgs = append(sidecarArgs, fmt.Sprint(*cluster.Spec.Routing.PodIPFamily))
-			if *cluster.Spec.Routing.PodIPFamily == 6 {
+			sidecarArgs = append(sidecarArgs, strconv.Itoa(cluster.GetPodIPFamily()))
+			if cluster.IsPodIPFamily6() {
 				// this is required to configure the Pods to listen for any incoming connection
 				// from any available IPv6 address on port 8080
 				sidecarArgs = append(sidecarArgs, "--bind-address", "[::]:8080")
@@ -615,7 +616,7 @@ func configureSidecarContainer(container *corev1.Container, initMode bool, proce
 	if len(imageConfigs) > 0 {
 		overrides.ImageConfigs = imageConfigs
 	} else {
-		overrides.ImageConfigs = []fdbv1beta2.ImageConfig{{BaseImage: "foundationdb/foundationdb-kubernetes-sidecar", TagSuffix: "-1"}}
+		overrides.ImageConfigs = []fdbv1beta2.ImageConfig{{BaseImage: fdbv1beta2.FoundationDBSidecarBaseImage, TagSuffix: "-1"}}
 	}
 
 	if overrides.EnableTLS && !initMode {
@@ -674,8 +675,7 @@ func getEnvForMonitorConfigSubstitution(cluster *fdbv1beta2.FoundationDBCluster,
 	if usePublicIPFromService {
 		publicIPKey = fmt.Sprintf("metadata.annotations['%s']", fdbv1beta2.PublicIPAnnotation)
 	} else {
-		family := cluster.Spec.Routing.PodIPFamily
-		if family == nil {
+		if cluster.GetPodIPFamily() == fdbv1beta2.PodIPFamilyUnset {
 			publicIPKey = "status.podIP"
 		} else {
 			publicIPKey = "status.podIPs"
@@ -687,8 +687,7 @@ func getEnvForMonitorConfigSubstitution(cluster *fdbv1beta2.FoundationDBCluster,
 
 	if cluster.NeedsExplicitListenAddress() {
 		podIPKey := ""
-		family := cluster.Spec.Routing.PodIPFamily
-		if family == nil {
+		if cluster.GetPodIPFamily() == fdbv1beta2.PodIPFamilyUnset {
 			podIPKey = "status.podIP"
 		} else {
 			podIPKey = "status.podIPs"
@@ -751,12 +750,7 @@ func GetPvc(cluster *fdbv1beta2.FoundationDBCluster, processGroup *fdbv1beta2.Pr
 	}
 
 	pvc.ObjectMeta = GetPvcMetadata(cluster, processGroup.ProcessClass, processGroup.ProcessGroupID)
-	name := processGroup.GetPodName(cluster)
-	if pvc.ObjectMeta.Name == "" {
-		pvc.ObjectMeta.Name = fmt.Sprintf("%s-data", name)
-	} else {
-		pvc.ObjectMeta.Name = fmt.Sprintf("%s-%s", name, pvc.ObjectMeta.Name)
-	}
+	pvc.ObjectMeta.Name = processGroup.GetPvcName(cluster)
 
 	if pvc.Spec.AccessModes == nil {
 		pvc.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
@@ -882,13 +876,13 @@ func GetBackupDeployment(backup *fdbv1beta2.FoundationDBBackup) (*appsv1.Deploym
 		if backup.UseUnifiedImage() {
 			backup.Spec.MainContainer.ImageConfigs = []fdbv1beta2.ImageConfig{
 				{
-					BaseImage: "foundationdb/foundationdb-kubernetes",
+					BaseImage: fdbv1beta2.FoundationDBKubernetesBaseImage,
 				},
 			}
 		} else {
 			backup.Spec.MainContainer.ImageConfigs = []fdbv1beta2.ImageConfig{
 				{
-					BaseImage: "foundationdb/foundationdb",
+					BaseImage: fdbv1beta2.FoundationDBBaseImage,
 				},
 			}
 		}
@@ -898,7 +892,7 @@ func GetBackupDeployment(backup *fdbv1beta2.FoundationDBBackup) (*appsv1.Deploym
 		if !backup.UseUnifiedImage() {
 			backup.Spec.SidecarContainer.ImageConfigs = []fdbv1beta2.ImageConfig{
 				{
-					BaseImage: "foundationdb/foundationdb-kubernetes-sidecar",
+					BaseImage: fdbv1beta2.FoundationDBSidecarBaseImage,
 					TagSuffix: "-1",
 				},
 			}
@@ -909,6 +903,7 @@ func GetBackupDeployment(backup *fdbv1beta2.FoundationDBBackup) (*appsv1.Deploym
 	if err != nil {
 		return nil, err
 	}
+
 	// Right now the main container only starts the backup agent without doing anything special.
 	mainContainer.Image = image
 	mainContainer.Command = []string{"backup_agent"}
@@ -983,7 +978,7 @@ func GetBackupDeployment(backup *fdbv1beta2.FoundationDBBackup) (*appsv1.Deploym
 			Name: "config-map",
 			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
 				LocalObjectReference: corev1.LocalObjectReference{
-					Name: fmt.Sprintf("%s-config", backup.Spec.ClusterName),
+					Name: getConfigMapName(backup.Spec.ClusterName),
 				},
 				Items: []corev1.KeyToPath{
 					{Key: fdbv1beta2.ClusterFileKey, Path: "fdb.cluster"},
@@ -1035,13 +1030,13 @@ func GetPodMetadata(cluster *fdbv1beta2.FoundationDBCluster, processClass fdbv1b
 	}
 
 	metadata := GetObjectMetadata(cluster, customMetadata, processClass, id)
-
 	if metadata.Annotations == nil {
 		metadata.Annotations = make(map[string]string)
 	}
 	metadata.Annotations[fdbv1beta2.LastSpecKey] = specHash
 	metadata.Annotations[fdbv1beta2.PublicIPSourceAnnotation] = string(cluster.GetPublicIPSource())
 	metadata.Annotations[fdbv1beta2.ImageTypeAnnotation] = string(cluster.DesiredImageType())
+	metadata.Annotations[fdbv1beta2.IPFamilyAnnotation] = strconv.Itoa(cluster.GetPodIPFamily())
 
 	return metadata
 }

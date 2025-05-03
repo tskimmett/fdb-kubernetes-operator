@@ -26,19 +26,18 @@ expected under different scenarios.
 */
 
 import (
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"k8s.io/utils/pointer"
 	"log"
 	"strconv"
 	"time"
 
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/e2e/fixtures"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/FoundationDB/fdb-kubernetes-operator/e2e/fixtures"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"k8s.io/utils/pointer"
 )
 
 var (
@@ -135,7 +134,7 @@ var _ = Describe("Operator Migrations", Label("e2e", "pr"), func() {
 
 		BeforeEach(func() {
 			spec := fdbCluster.GetCluster().Spec.DeepCopy()
-			initialEngine := spec.DatabaseConfiguration.NormalizeConfiguration().StorageEngine
+			initialEngine := spec.DatabaseConfiguration.NormalizeConfiguration(fdbCluster.GetCluster()).StorageEngine
 			log.Println("initialEngine", initialEngine)
 			if initialEngine == fdbv1beta2.StorageEngineSSD2 {
 				newStorageEngine = fdbv1beta2.StorageEngineRocksDbV1

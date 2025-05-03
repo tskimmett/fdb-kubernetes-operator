@@ -374,12 +374,12 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 			Expect(counts).To(Equal(ProcessCounts{
 				Storage:   5,
 				Log:       4,
-				Stateless: 9,
+				Stateless: 22,
 			}))
 			Expect(counts.Map()).To(Equal(map[ProcessClass]int{
 				ProcessClassStorage:   5,
 				ProcessClassLog:       4,
-				ProcessClassStateless: 9,
+				ProcessClassStateless: 22,
 			}))
 			Expect(cluster.Spec.ProcessCounts).To(Equal(ProcessCounts{}))
 
@@ -395,12 +395,12 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 			}
 			counts, err = cluster.GetProcessCountsWithDefaults()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(counts.Stateless).To(Equal(8))
+			Expect(counts.Stateless).To(Equal(21))
 			Expect(counts.ClusterController).To(Equal(3))
 			Expect(counts.Map()).To(Equal(map[ProcessClass]int{
 				ProcessClassStorage:           5,
 				ProcessClassLog:               4,
-				ProcessClassStateless:         8,
+				ProcessClassStateless:         21,
 				ProcessClassClusterController: 3,
 			}))
 
@@ -420,31 +420,6 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 			Expect(counts).To(Equal(ProcessCounts{
 				Storage:   5,
 				Log:       5,
-				Stateless: 9,
-			}))
-		})
-
-		When("using a version that supports grv and commit proxies", func() {
-			It("should return the default process counts", func() {
-				cluster.Spec.Version = "7.1.0"
-				counts, err := cluster.GetProcessCountsWithDefaults()
-				Expect(err).NotTo(HaveOccurred())
-				Expect(counts).To(Equal(ProcessCounts{
-					Storage:   5,
-					Log:       4,
-					Stateless: 22,
-				}))
-			})
-		})
-
-		It("should return the default process counts when proxies are unset", func() {
-			cluster.Spec.Version = "7.1.0-rc2"
-			cluster.Spec.DatabaseConfiguration.Proxies = 0
-			counts, err := cluster.GetProcessCountsWithDefaults()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(counts).To(Equal(ProcessCounts{
-				Storage:   5,
-				Log:       4,
 				Stateless: 22,
 			}))
 		})
@@ -675,38 +650,6 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 	})
 
 	When("getting desired database configuration", func() {
-		When("the FDB version doesn't support storage migration", func() {
-			var configuration DatabaseConfiguration
-
-			BeforeEach(func() {
-				cluster := &FoundationDBCluster{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "foo",
-						Namespace: "default",
-					},
-					Spec: FoundationDBClusterSpec{
-						Version: "6.3.0",
-					},
-				}
-
-				configuration = cluster.DesiredDatabaseConfiguration()
-			})
-
-			It("should set the all storage migration related values to the empty defaults", func() {
-				Expect(configuration.PerpetualStorageWiggleLocality).To(BeNil())
-				Expect(configuration.PerpetualStorageWiggle).To(BeNil())
-				Expect(configuration.StorageMigrationType).To(BeNil())
-			})
-			It("should set the all storage migration related values to the empty defaults", func() {
-				configurationString, err := configuration.GetConfigurationString("6.3.0")
-				Expect(err).NotTo(HaveOccurred())
-				Expect(configurationString).NotTo(ContainSubstring("storage_migration_type"))
-				Expect(configurationString).NotTo(ContainSubstring("perpetual_storage_wiggle"))
-				Expect(configurationString).NotTo(ContainSubstring("perpetual_storage_wiggle_locality"))
-				Expect(configurationString).NotTo(ContainSubstring("perpetual_storage_wiggle_engine"))
-			})
-		})
-
 		When("the FDB version does support the storage migration", func() {
 			var configuration DatabaseConfiguration
 
@@ -732,7 +675,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 				})
 
 				It("should set the all storage migration related values to the empty defaults", func() {
-					configurationString, err := configuration.GetConfigurationString("7.1.0")
+					configurationString, err := configuration.GetConfigurationString()
 					Expect(err).NotTo(HaveOccurred())
 					Expect(configurationString).NotTo(ContainSubstring("storage_migration_type=disabled"))
 					Expect(configurationString).NotTo(ContainSubstring("perpetual_storage_wiggle"))
@@ -772,7 +715,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 				})
 
 				It("should set the all storage migration related values to the empty defaults", func() {
-					configurationString, err := configuration.GetConfigurationString("7.1.0")
+					configurationString, err := configuration.GetConfigurationString()
 					Expect(err).NotTo(HaveOccurred())
 					Expect(configurationString).To(ContainSubstring("storage_migration_type=gradual"))
 					Expect(configurationString).To(ContainSubstring("perpetual_storage_wiggle=1"))
@@ -816,7 +759,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 				})
 
 				It("should set the all storage migration related values to the empty defaults", func() {
-					configurationString, err := configuration.GetConfigurationString("7.1.0")
+					configurationString, err := configuration.GetConfigurationString()
 					Expect(err).NotTo(HaveOccurred())
 					Expect(configurationString).To(ContainSubstring("storage_migration_type=gradual"))
 					Expect(configurationString).To(ContainSubstring("perpetual_storage_wiggle=1"))
@@ -861,32 +804,183 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 		},
 	}
 
-	coordinatorsStr := []string{
+	coordinatorsList := []string{
 		"127.0.0.1:4500",
 		"127.0.0.2:4500",
 		"127.0.0.3:4500",
 	}
 
 	When("parsing the connection string", func() {
-		It("should be parsed correctly", func() {
-			str, err := ParseConnectionString("test:abcd@127.0.0.1:4500,127.0.0.2:4500,127.0.0.3:4500")
-			Expect(err).NotTo(HaveOccurred())
-			Expect(str.DatabaseName).To(Equal("test"))
-			Expect(str.GenerationID).To(Equal("abcd"))
-			Expect(str.Coordinators).To(Equal(coordinatorsStr))
+		var str ConnectionString
+		var err error
+		var input string
 
-			str, err = ParseConnectionString("test:abcd")
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(Equal("invalid connection string test:abcd"))
+		JustBeforeEach(func() {
+			str, err = ParseConnectionString(input)
+		})
+
+		When("the input is valid", func() {
+			BeforeEach(func() {
+				input = "test:abcd@127.0.0.1:4500,127.0.0.2:4500,127.0.0.3:4500"
+			})
+
+			It("should be parsed correctly", func() {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(str.DatabaseName).To(Equal("test"))
+				Expect(str.GenerationID).To(Equal("abcd"))
+				Expect(str.Coordinators).To(ConsistOf(coordinatorsList))
+			})
+		})
+
+		When("the input is invalid", func() {
+			BeforeEach(func() {
+				input = "test:abcd"
+			})
+
+			It("should return an error", func() {
+				Expect(err).To(MatchError(Equal("invalid connection string: test:abcd, could not split string to get generation ID")))
+			})
+		})
+
+		When("the input has an invalid char", func() {
+			BeforeEach(func() {
+				input = "te-st:abcd"
+			})
+
+			It("should return an error", func() {
+				Expect(err).To(MatchError(Equal("invalid connection string: te-st:abcd, database description can only contain alphanumeric characters (a-z, A-Z, 0-9) and underscores")))
+			})
+		})
+
+		When("the input has an empty description", func() {
+			BeforeEach(func() {
+				input = ":abcd@127.0.0.1:4500,127.0.0.2:4500,127.0.0.3:4500"
+			})
+
+			It("should return an error", func() {
+				Expect(err).To(MatchError(Equal("invalid connection string: :abcd@127.0.0.1:4500,127.0.0.2:4500,127.0.0.3:4500, database description can only contain alphanumeric characters (a-z, A-Z, 0-9) and underscores")))
+			})
+		})
+
+		When("the input has an empty generation ID", func() {
+			BeforeEach(func() {
+				input = "test:@127.0.0.1:4500,127.0.0.2:4500,127.0.0.3:4500"
+			})
+
+			It("should return an error", func() {
+				Expect(err).To(MatchError(Equal("invalid connection string: test:@127.0.0.1:4500,127.0.0.2:4500,127.0.0.3:4500, generation ID can only contain alphanumeric characters (a-z, A-Z, 0-9)")))
+			})
+		})
+
+		When("the input has no coordinators", func() {
+			BeforeEach(func() {
+				input = "test:abcd@"
+			})
+
+			It("should return an error", func() {
+				Expect(err).To(MatchError(Equal("invalid connection string: test:abcd@, could not parse coordinator address: <nil>, got error: cannot parse empty address")))
+			})
+		})
+
+		When("the input is valid with a single char description", func() {
+			BeforeEach(func() {
+				input = "s:abcd@127.0.0.1:4500,127.0.0.2:4500,127.0.0.3:4500"
+			})
+
+			It("should be parsed correctly", func() {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(str.DatabaseName).To(Equal("s"))
+				Expect(str.GenerationID).To(Equal("abcd"))
+				Expect(str.Coordinators).To(ConsistOf(coordinatorsList))
+			})
+		})
+
+		When("the input is valid with multiple underscores", func() {
+			BeforeEach(func() {
+				input = "fdb_cluster_52v1bpr8:rhUbBjrtyweZBQO1U3Td81zyP9d46yEh@100.82.81.253:4500:tls,100.82.71.5:4500:tls,100.82.119.151:4500:tls,100.82.122.125:4500:tls,100.82.76.240:4500:tls"
+			})
+
+			It("should be parsed correctly", func() {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(str.DatabaseName).To(Equal("fdb_cluster_52v1bpr8"))
+				Expect(str.GenerationID).To(Equal("rhUbBjrtyweZBQO1U3Td81zyP9d46yEh"))
+				Expect(str.Coordinators).To(ConsistOf([]string{
+					"100.82.81.253:4500:tls",
+					"100.82.71.5:4500:tls",
+					"100.82.119.151:4500:tls",
+					"100.82.122.125:4500:tls",
+					"100.82.76.240:4500:tls",
+				}))
+			})
+		})
+
+		When("the input is valid with DNS entries", func() {
+			BeforeEach(func() {
+				input = "fdb_cluster_52v1bpr8:rhUbBjrtyweZBQO1U3Td81zyP9d46yEh@coordinator1.test.svc.cluster.local:4500:tls,coordinator2.test.svc.cluster.local:4500:tls,coordinator2.test.svc.cluster.local:4500:tls"
+			})
+
+			It("should be parsed correctly", func() {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(str.DatabaseName).To(Equal("fdb_cluster_52v1bpr8"))
+				Expect(str.GenerationID).To(Equal("rhUbBjrtyweZBQO1U3Td81zyP9d46yEh"))
+				Expect(str.Coordinators).To(ConsistOf([]string{
+					"coordinator1.test.svc.cluster.local:4500:tls",
+					"coordinator2.test.svc.cluster.local:4500:tls",
+					"coordinator2.test.svc.cluster.local:4500:tls",
+				}))
+			})
+		})
+
+		When("the input is valid with IPv6 entries", func() {
+			BeforeEach(func() {
+				input = "fdb_cluster_52v1bpr8:rhUbBjrtyweZBQO1U3Td81zyP9d46yEh@[0100::2]:4500:tls,[0100::3]:4500:tls,[0100::4]:4500:tls"
+			})
+
+			It("should be parsed correctly", func() {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(str.DatabaseName).To(Equal("fdb_cluster_52v1bpr8"))
+				Expect(str.GenerationID).To(Equal("rhUbBjrtyweZBQO1U3Td81zyP9d46yEh"))
+				Expect(str.Coordinators).To(ConsistOf([]string{
+					"[100::2]:4500:tls",
+					"[100::3]:4500:tls",
+					"[100::4]:4500:tls",
+				}))
+			})
+		})
+
+		When("the input is valid with IPv6 and IPv4 entries", func() {
+			BeforeEach(func() {
+				input = "fdb_cluster_52v1bpr8:rhUbBjrtyweZBQO1U3Td81zyP9d46yEh@100.82.81.253:4500:tls,100.82.71.5:4500:tls,100.82.119.151:4500:tls,[0100::3]:4500:tls,[0100::4]:4500:tls"
+			})
+
+			It("should be parsed correctly", func() {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(str.DatabaseName).To(Equal("fdb_cluster_52v1bpr8"))
+				Expect(str.GenerationID).To(Equal("rhUbBjrtyweZBQO1U3Td81zyP9d46yEh"))
+				Expect(str.Coordinators).To(ConsistOf([]string{
+					"100.82.81.253:4500:tls",
+					"100.82.71.5:4500:tls",
+					"100.82.119.151:4500:tls",
+					"[100::3]:4500:tls",
+					"[100::4]:4500:tls",
+				}))
+			})
 		})
 	})
+
+	DescribeTable("sanitize connection string description", func(input string, expected string) {
+		Expect(SanitizeConnectionStringDescription(input)).To(Equal(expected))
+	},
+		Entry("without hyphen", "test", "test"),
+		Entry("with hyphen", "test-string", "test_string"),
+	)
 
 	When("formatting the connection string", func() {
 		It("should be formatted correctly", func() {
 			str := ConnectionString{
 				DatabaseName: "test",
 				GenerationID: "abcd",
-				Coordinators: coordinatorsStr,
+				Coordinators: coordinatorsList,
 			}
 			Expect(str.String()).To(Equal("test:abcd@127.0.0.1:4500,127.0.0.2:4500,127.0.0.3:4500"))
 		})
@@ -897,7 +991,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 			str := ConnectionString{
 				DatabaseName: "test",
 				GenerationID: "abcd",
-				Coordinators: coordinatorsStr,
+				Coordinators: coordinatorsList,
 			}
 			err := str.GenerateNewGenerationID()
 			Expect(err).NotTo(HaveOccurred())
@@ -910,7 +1004,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 			str := ConnectionString{
 				DatabaseName: "test",
 				GenerationID: "abcd",
-				Coordinators: coordinatorsStr,
+				Coordinators: coordinatorsList,
 			}
 			Expect(str.HasCoordinators(coordinators)).To(BeTrue())
 			// We have to copy the slice to prevent to modify the original slice
@@ -1090,105 +1184,6 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 				}))
 			})
 		})
-
-		When("the version does not support grv and commit proxies", func() {
-			BeforeEach(func() {
-				cluster = &FoundationDBCluster{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "foo",
-						Namespace: "default",
-					},
-					Spec: FoundationDBClusterSpec{
-						DatabaseConfiguration: DatabaseConfiguration{
-							RedundancyMode: RedundancyModeDouble,
-							StorageEngine:  StorageEngineSSD,
-							RoleCounts: RoleCounts{
-								Storage: 5,
-								Logs:    4,
-								Proxies: 5,
-							},
-						},
-						Version: "6.3.23",
-					},
-				}
-			})
-
-			It("should be parsed correctly", func() {
-				Expect(cluster.DesiredDatabaseConfiguration()).To(Equal(DatabaseConfiguration{
-					RedundancyMode: RedundancyModeDouble,
-					StorageEngine:  StorageEngineSSD2,
-					UsableRegions:  1,
-					RoleCounts: RoleCounts{
-						Logs:          4,
-						Proxies:       5,
-						CommitProxies: 0,
-						GrvProxies:    0,
-						Resolvers:     1,
-						LogRouters:    -1,
-						RemoteLogs:    -1,
-					},
-				}))
-
-				cluster.Spec = FoundationDBClusterSpec{}
-
-				Expect(cluster.DesiredDatabaseConfiguration()).To(Equal(DatabaseConfiguration{
-					RedundancyMode: RedundancyModeDouble,
-					StorageEngine:  StorageEngineSSD2,
-					UsableRegions:  1,
-					RoleCounts: RoleCounts{
-						Logs:          3,
-						Proxies:       3,
-						CommitProxies: 0,
-						GrvProxies:    0,
-						Resolvers:     1,
-						LogRouters:    -1,
-						RemoteLogs:    -1,
-					},
-				}))
-			})
-
-			When("grv and commit proxies are passed in addition to proxies", func() {
-				BeforeEach(func() {
-					cluster = &FoundationDBCluster{
-						ObjectMeta: metav1.ObjectMeta{
-							Name:      "foo",
-							Namespace: "default",
-						},
-						Spec: FoundationDBClusterSpec{
-							DatabaseConfiguration: DatabaseConfiguration{
-								RedundancyMode: RedundancyModeDouble,
-								StorageEngine:  StorageEngineSSD,
-								RoleCounts: RoleCounts{
-									Storage:       5,
-									Logs:          4,
-									Proxies:       5,
-									GrvProxies:    1,
-									CommitProxies: 1,
-								},
-							},
-							Version: "6.3.23",
-						},
-					}
-				})
-
-				It("should be only contain the configured proxies", func() {
-					Expect(cluster.DesiredDatabaseConfiguration()).To(Equal(DatabaseConfiguration{
-						RedundancyMode: RedundancyModeDouble,
-						StorageEngine:  StorageEngineSSD2,
-						UsableRegions:  1,
-						RoleCounts: RoleCounts{
-							Logs:          4,
-							Proxies:       5,
-							CommitProxies: 0,
-							GrvProxies:    0,
-							Resolvers:     1,
-							LogRouters:    -1,
-							RemoteLogs:    -1,
-						},
-					}))
-				})
-			})
-		})
 	})
 
 	When("getting the configuration string", func() {
@@ -1206,8 +1201,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 			}
 			// This check is not version dependent
 			Expect(configuration.AreSeparatedProxiesConfigured()).To(BeTrue())
-			Expect(configuration.GetConfigurationString("6.3.24")).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 proxies=1 regions=[]"))
-			Expect(configuration.GetConfigurationString("7.1.0")).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 commit_proxies=4 grv_proxies=2 regions=[]"))
+			Expect(configuration.GetConfigurationString()).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 commit_proxies=4 grv_proxies=2 regions=[]"))
 
 			configuration.Regions = []Region{{
 				DataCenters: []DataCenter{{
@@ -1217,14 +1211,10 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 				}},
 				SatelliteLogs: 2,
 			}}
-			Expect(configuration.GetConfigurationString("6.3.24")).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 proxies=1 regions=[{\\\"datacenters\\\":[{\\\"id\\\":\\\"iad\\\",\\\"priority\\\":1}],\\\"satellite_logs\\\":2}]"))
+			Expect(configuration.GetConfigurationString()).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 commit_proxies=4 grv_proxies=2 regions=[{\\\"datacenters\\\":[{\\\"id\\\":\\\"iad\\\",\\\"priority\\\":1}],\\\"satellite_logs\\\":2}]"))
 			configuration.Regions = nil
-
 			configuration.VersionFlags.LogSpill = 3
-			Expect(configuration.GetConfigurationString("6.3.24")).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 proxies=1 log_spill:=3 regions=[]"))
-
-			Expect(configuration.GetConfigurationString("7.0.0")).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 commit_proxies=4 grv_proxies=2 log_spill:=3 regions=[]"))
-			Expect(configuration.GetConfigurationString("7.1.0-rc1")).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 commit_proxies=4 grv_proxies=2 log_spill:=3 regions=[]"))
+			Expect(configuration.GetConfigurationString()).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 commit_proxies=4 grv_proxies=2 log_spill:=3 regions=[]"))
 		})
 
 		When("CommitProxies and GrvProxies are not configured", func() {
@@ -1238,14 +1228,12 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 				},
 			}
 			It("should be parsed correctly", func() {
-				Expect(configuration.GetConfigurationString("6.3.24")).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 proxies=1 regions=[]"))
-				Expect(configuration.GetConfigurationString("7.0.0")).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 proxies=1 regions=[]"))
+				Expect(configuration.GetConfigurationString()).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 proxies=1 regions=[]"))
 			})
 
 			It("should have no proxies configured", func() {
-				version, _ := ParseFdbVersion("7.0.0")
 				Expect(configuration.AreSeparatedProxiesConfigured()).To(BeFalse())
-				Expect(configuration.GetProxiesString(version)).To(Equal(" proxies=1"))
+				Expect(configuration.GetProxiesString()).To(Equal(" proxies=1"))
 			})
 		})
 
@@ -1260,18 +1248,11 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 					GrvProxies:    1,
 				},
 			}
-			It("should have old proxies configuration with version FDB < 7.0.0 ", func() {
-				version, _ := ParseFdbVersion("6.3.24")
-				Expect(configuration.AreSeparatedProxiesConfigured()).To(BeTrue())
-				Expect(configuration.GetProxiesString(version)).To(Equal(" proxies=3"))
-				Expect(configuration.GetConfigurationString("6.3.24")).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 proxies=3 regions=[]"))
-			})
 
 			It("should have separated proxies configured with FDB > 7.0.0", func() {
-				version, _ := ParseFdbVersion("7.0.0")
 				Expect(configuration.AreSeparatedProxiesConfigured()).To(BeTrue())
-				Expect(configuration.GetProxiesString(version)).To(Equal(" commit_proxies=2 grv_proxies=1"))
-				Expect(configuration.GetConfigurationString("7.0.0")).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 commit_proxies=2 grv_proxies=1 regions=[]"))
+				Expect(configuration.GetProxiesString()).To(Equal(" commit_proxies=2 grv_proxies=1"))
+				Expect(configuration.GetConfigurationString()).To(Equal("double ssd usable_regions=1 logs=5 resolvers=0 log_routers=0 remote_logs=0 commit_proxies=2 grv_proxies=1 regions=[]"))
 			})
 		})
 	})
@@ -2681,12 +2662,11 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 	})
 
 	Context("Normalize cluster spec", func() {
-		version := "7.1.0"
 		When("log routers are missing", func() {
 			It("should set the correct value (-1) for log routers", func() {
 				spec := DatabaseConfiguration{}
 				spec.RemoteLogs = 9
-				normalized := spec.NormalizeConfigurationWithSeparatedProxies(version, false)
+				normalized := spec.NormalizeConfiguration(&FoundationDBCluster{})
 				Expect(normalized.LogRouters).To(Equal(-1))
 				Expect(normalized.RemoteLogs).To(Equal(9))
 			})
@@ -2734,7 +2714,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 						},
 					},
 				}
-				normalized := spec.NormalizeConfigurationWithSeparatedProxies(version, false)
+				normalized := spec.NormalizeConfiguration(&FoundationDBCluster{})
 				Expect(normalized.Regions).To(Equal([]Region{
 					{
 						DataCenters: []DataCenter{
@@ -2818,7 +2798,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 						},
 					},
 				}
-				normalized := spec.NormalizeConfigurationWithSeparatedProxies(version, false)
+				normalized := spec.NormalizeConfiguration(&FoundationDBCluster{})
 				Expect(normalized.Regions).To(Equal([]Region{
 					{
 						DataCenters: []DataCenter{
@@ -4508,13 +4488,9 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 		})
 
 		When("FoundationDB supports DNS in the cluster file", func() {
-			BeforeEach(func() {
-				cluster.Status.RunningVersion = Versions.SupportsDNSInClusterFile.String()
-			})
-
 			When("checking whether we need a headless service", func() {
-				It("respects the headless service setting", func() {
-					Expect(cluster.NeedsHeadlessService()).To(BeFalse())
+				It("should always return true as the default is using DNS", func() {
+					Expect(cluster.NeedsHeadlessService()).To(BeTrue())
 
 					cluster.Spec.Routing.HeadlessService = pointer.Bool(true)
 					Expect(cluster.NeedsHeadlessService()).To(BeTrue())
@@ -4528,22 +4504,22 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 
 				It("can be overridden by the DNS in locality setting", func() {
 					cluster.Spec.Routing.HeadlessService = pointer.Bool(false)
-					cluster.Spec.Routing.DefineDNSLocalityFields = pointer.Bool(true)
 					Expect(cluster.NeedsHeadlessService()).To(BeTrue())
 				})
 			})
 
 			When("checking whether we use DNS in the cluster file", func() {
 				It("respects the value in the flag", func() {
-					Expect(cluster.UseDNSInClusterFile()).To(BeFalse())
-
-					cluster.Spec.Routing.UseDNSInClusterFile = pointer.Bool(true)
 					Expect(cluster.UseDNSInClusterFile()).To(BeTrue())
+
+					cluster.Spec.Routing.UseDNSInClusterFile = pointer.Bool(false)
+					Expect(cluster.UseDNSInClusterFile()).To(BeFalse())
 				})
 			})
 
 			When("checking whether we use DNS in the locality fields", func() {
 				It("respects the value in the flag", func() {
+					cluster.Spec.Routing.UseDNSInClusterFile = pointer.Bool(false)
 					Expect(cluster.DefineDNSLocalityFields()).To(BeFalse())
 
 					cluster.Spec.Routing.DefineDNSLocalityFields = pointer.Bool(true)
@@ -4563,19 +4539,6 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 					suffix := "cluster.example"
 					cluster.Spec.Routing.DNSDomain = &suffix
 					Expect(cluster.GetDNSDomain()).To(Equal(suffix))
-				})
-			})
-		})
-
-		When("FoundationDB does not support DNS in the cluster file", func() {
-			BeforeEach(func() {
-				cluster.Status.RunningVersion = Versions.MinimumVersion.String()
-			})
-
-			When("checking if DNS should be used", func() {
-				It("should return false", func() {
-					cluster.Spec.Routing.HeadlessService = pointer.Bool(true)
-					Expect(cluster.UseDNSInClusterFile()).To(BeFalse())
 				})
 			})
 		})
@@ -4928,7 +4891,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 			Entry("valid cluster spec",
 				&FoundationDBCluster{
 					Spec: FoundationDBClusterSpec{
-						Version: "6.3.2",
+						Version: Versions.Default.String(),
 						DatabaseConfiguration: DatabaseConfiguration{
 							StorageEngine: StorageEngineSSD2,
 						},
@@ -4936,32 +4899,10 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 				},
 				nil,
 			),
-			Entry("using invalid storage engine",
-				&FoundationDBCluster{
-					Spec: FoundationDBClusterSpec{
-						Version: "6.3.2",
-						DatabaseConfiguration: DatabaseConfiguration{
-							StorageEngine: StorageEngineRocksDbV1,
-						},
-					},
-				},
-				fmt.Errorf("storage engine ssd-rocksdb-v1 is not supported on version 6.3.2"),
-			),
-			Entry("using invalid storage engine",
-				&FoundationDBCluster{
-					Spec: FoundationDBClusterSpec{
-						Version: "6.3.24",
-						DatabaseConfiguration: DatabaseConfiguration{
-							StorageEngine: StorageEngineRedwood1Experimental,
-						},
-					},
-				},
-				fmt.Errorf("storage engine ssd-redwood-1-experimental is not supported on version 6.3.24"),
-			),
 			Entry("using valid storage engine",
 				&FoundationDBCluster{
 					Spec: FoundationDBClusterSpec{
-						Version: Versions.SupportsRocksDBV1.String(),
+						Version: Versions.Default.String(),
 						DatabaseConfiguration: DatabaseConfiguration{
 							StorageEngine: StorageEngineRocksDbV1,
 						},
@@ -4972,7 +4913,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 			Entry("using valid coordinator selection",
 				&FoundationDBCluster{
 					Spec: FoundationDBClusterSpec{
-						Version: Versions.SupportsRocksDBV1.String(),
+						Version: Versions.Default.String(),
 						DatabaseConfiguration: DatabaseConfiguration{
 							StorageEngine: StorageEngineRocksDbV1,
 						},
@@ -4997,7 +4938,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 			Entry("using invalid coordinator selection",
 				&FoundationDBCluster{
 					Spec: FoundationDBClusterSpec{
-						Version: Versions.SupportsRocksDBV1.String(),
+						Version: Versions.Default.String(),
 						DatabaseConfiguration: DatabaseConfiguration{
 							StorageEngine: StorageEngineRocksDbV1,
 						},
@@ -5025,9 +4966,9 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 			Entry("multiple validations",
 				&FoundationDBCluster{
 					Spec: FoundationDBClusterSpec{
-						Version: "6.2.20",
+						Version: Versions.Default.String(),
 						DatabaseConfiguration: DatabaseConfiguration{
-							StorageEngine: StorageEngineRocksDbV1,
+							StorageEngine: StorageEngineShardedRocksDB,
 						},
 						CoordinatorSelection: []CoordinatorSelectionSetting{
 							{
@@ -5036,23 +4977,23 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 						},
 					},
 				},
-				fmt.Errorf("storage engine ssd-rocksdb-v1 is not supported on version 6.2.20, stateless is not a valid process class for coordinators"),
+				fmt.Errorf("storage engine ssd-sharded-rocksdb is not supported on version 7.1.57, stateless is not a valid process class for coordinators"),
 			),
 			Entry("using invalid version for sharded rocksdb",
 				&FoundationDBCluster{
 					Spec: FoundationDBClusterSpec{
-						Version: "7.1.4",
+						Version: Versions.Default.String(),
 						DatabaseConfiguration: DatabaseConfiguration{
 							StorageEngine: StorageEngineShardedRocksDB,
 						},
 					},
 				},
-				fmt.Errorf("storage engine ssd-sharded-rocksdb is not supported on version 7.1.4"),
+				fmt.Errorf("storage engine ssd-sharded-rocksdb is not supported on version 7.1.57"),
 			),
 			Entry("using valid version for sharded rocksdb",
 				&FoundationDBCluster{
 					Spec: FoundationDBClusterSpec{
-						Version: "7.2.0",
+						Version: Versions.SupportsShardedRocksDB.String(),
 						DatabaseConfiguration: DatabaseConfiguration{
 							StorageEngine: StorageEngineShardedRocksDB,
 						},
@@ -5069,7 +5010,7 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 						},
 					},
 				},
-				fmt.Errorf("version: 6.1.0 is not supported, minimum supported version is: 6.2.20"),
+				fmt.Errorf("version: 7.0.0 is not supported, minimum supported version is: 7.1.0"),
 			),
 		)
 	})
@@ -5806,6 +5747,53 @@ var _ = Describe("[api] FoundationDBCluster", func() {
 				Expect(processGroup.ProcessGroupConditions).To(HaveLen(2))
 				Expect(processGroup.ProcessClass).To(Equal(processClass))
 				Expect(processGroup.ProcessGroupID).To(Equal(processGroupID))
+			})
+		})
+	})
+
+	When("validating if the new process group ID is allowed", func() {
+		var valid bool
+		var cluster *FoundationDBCluster
+		var exclusions map[ProcessGroupID]None
+
+		JustBeforeEach(func() {
+			valid = cluster.newProcessGroupIDAllowed(ProcessGroupID("storage-1"), exclusions)
+		})
+
+		When("no process group is marked for removal or excluded", func() {
+			BeforeEach(func() {
+				cluster = &FoundationDBCluster{}
+			})
+
+			It("should detect the new process group ID as valid", func() {
+				Expect(valid).To(BeTrue())
+			})
+		})
+
+		When("the process group is marked for removal", func() {
+			BeforeEach(func() {
+				cluster = &FoundationDBCluster{
+					Spec: FoundationDBClusterSpec{
+						ProcessGroupsToRemove: []ProcessGroupID{ProcessGroupID("storage-1")},
+					},
+				}
+			})
+
+			It("should detect the new process group ID as invalid", func() {
+				Expect(valid).To(BeFalse())
+			})
+		})
+
+		When("the process group is excluded", func() {
+			BeforeEach(func() {
+				cluster = &FoundationDBCluster{}
+				exclusions = map[ProcessGroupID]None{
+					ProcessGroupID("storage-1"): {},
+				}
+			})
+
+			It("should detect the new process group ID as invalid", func() {
+				Expect(valid).To(BeFalse())
 			})
 		})
 	})

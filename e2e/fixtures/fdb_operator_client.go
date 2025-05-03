@@ -34,7 +34,7 @@ import (
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	"github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -486,8 +486,8 @@ spec:
           # We are setting low values here as the e2e test are taking down processes multiple times
           # and having a high wait time between recoveries will increase the reliability of the cluster but also
           # increase the time our e2e test take.
-          - --minimum-recovery-time-for-inclusion=1.0
-          - --minimum-recovery-time-for-exclusion=1.0
+          - --minimum-recovery-time-for-inclusion=30.0
+          - --minimum-recovery-time-for-exclusion=30.0
           - --cluster-label-key-for-node-trigger=foundationdb.org/fdb-cluster-name
           - --enable-node-index
           - --replace-on-security-context-change
@@ -533,7 +533,6 @@ type SidecarConfig struct {
 
 // getSidecarConfigs returns the sidecar config based on the provided imageConfigs.
 func (factory *Factory) getSidecarConfigs(imageConfigs []fdbv1beta2.ImageConfig) []SidecarConfig {
-	var hasCopyPrimarySet bool
 	additionalSidecarVersions := factory.GetAdditionalSidecarVersions()
 	sidecarConfigs := make([]SidecarConfig, 0, len(additionalSidecarVersions)+1)
 	pullPolicy := factory.getImagePullPolicy()
@@ -542,11 +541,7 @@ func (factory *Factory) getSidecarConfigs(imageConfigs []fdbv1beta2.ImageConfig)
 		Image:           fdbv1beta2.SelectImageConfig(imageConfigs, factory.GetFDBVersionAsString()).Image(),
 		FDBVersion:      factory.GetFDBVersion(),
 		ImagePullPolicy: pullPolicy,
-	}
-
-	if factory.GetFDBVersion().SupportsDNSInClusterFile() {
-		defaultConfig.CopyAsPrimary = true
-		hasCopyPrimarySet = true
+		CopyAsPrimary:   true,
 	}
 
 	sidecarConfigs = append(
@@ -565,11 +560,6 @@ func (factory *Factory) getSidecarConfigs(imageConfigs []fdbv1beta2.ImageConfig)
 			Image:           fdbv1beta2.SelectImageConfig(imageConfigs, version.String()).Image(),
 			FDBVersion:      version,
 			ImagePullPolicy: pullPolicy,
-		}
-
-		if !hasCopyPrimarySet && version.SupportsDNSInClusterFile() {
-			sidecarConfig.CopyAsPrimary = true
-			hasCopyPrimarySet = true
 		}
 
 		sidecarConfigs = append(

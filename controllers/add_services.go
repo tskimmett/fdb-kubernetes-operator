@@ -22,14 +22,15 @@ package controllers
 
 import (
 	"context"
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
+
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
 	"github.com/go-logr/logr"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -107,8 +108,8 @@ func recreateService(ctx context.Context, r *FoundationDBClusterReconciler, curr
 	if err != nil {
 		return err
 	}
-	err = r.Create(ctx, newService)
-	return err
+
+	return r.Create(ctx, newService)
 }
 
 // updateServices updates selected safe fields on a service based on a new
@@ -123,10 +124,10 @@ func updateService(ctx context.Context, logger logr.Logger, cluster *fdbv1beta2.
 
 	needsUpdate := !equality.Semantic.DeepEqual(currentService.Spec, *originalSpec)
 	metadata := currentService.ObjectMeta
-	if mergeLabelsInMetadata(&metadata, newService.ObjectMeta) {
+	if internal.MergeLabels(&metadata, newService.ObjectMeta) {
 		needsUpdate = true
 	}
-	if mergeAnnotations(&metadata, newService.ObjectMeta) {
+	if internal.MergeAnnotations(&metadata, newService.ObjectMeta) {
 		needsUpdate = true
 	}
 	if needsUpdate {
@@ -134,5 +135,6 @@ func updateService(ctx context.Context, logger logr.Logger, cluster *fdbv1beta2.
 		logger.Info("Updating service")
 		return r.Update(ctx, currentService)
 	}
+
 	return nil
 }

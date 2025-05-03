@@ -1,8 +1,8 @@
-ARG FDB_VERSION=6.2.29
+ARG FDB_VERSION=7.1.67
 ARG FDB_WEBSITE=https://github.com/apple/foundationdb/releases/download
 
 # Build the manager binary
-FROM docker.io/library/golang:1.22.10 AS builder
+FROM docker.io/library/golang:1.23.7 AS builder
 
 ARG FDB_VERSION
 ARG FDB_WEBSITE
@@ -17,8 +17,7 @@ RUN if [ "$TARGETPLATFORM" != "linux/amd64" && "$TARGETPLATFORM" != "linux/arm64
 RUN set -eux && \
     curl --fail -L "${FDB_WEBSITE}/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb" -o foundationdb-clients_${FDB_VERSION}-1_amd64.deb && \
     curl --fail -L "${FDB_WEBSITE}/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb" -o foundationdb-clients_${FDB_VERSION}-1_amd64.deb.sha256
-    # TODO(johscheuer): The 6.2.29 sha256 file is not well formatted, enable this check again once 7.1 is used as base. \
-    # sha256sum -c foundationdb-clients_${FDB_VERSION}-1_amd64.deb.sha256 && \
+    sha256sum -c foundationdb-clients_${FDB_VERSION}-1_amd64.deb.sha256 && \
 
 # download arm version of libfdb_c and amd version of the headers
 RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
@@ -87,8 +86,7 @@ RUN set -eux && \
     curl --fail -L "${FDB_WEBSITE}/${FDB_VERSION}/foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm.sha256" -o foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm.sha256 && \
     microdnf install -y glibc pkg-config cpio && \
     microdnf clean all
-    # TODO(johscheuer): The 6.2.29 sha256 file is not well formatted, enable this check again once 7.1 is used as base. \
-    # sha256sum -c foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm.sha256 && \
+    sha256sum -c foundationdb-clients-${FDB_VERSION}-1.el7.x86_64.rpm.sha256 && \
 
 RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
     curl --create-dirs -Lo /lib64/libfdb_c.so "${FDB_WEBSITE}/${FDB_VERSION}/libfdb_c.aarch64.so" && \

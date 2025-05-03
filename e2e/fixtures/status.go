@@ -32,7 +32,7 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
@@ -77,7 +77,7 @@ func (fdbCluster *FdbCluster) RunFdbCliCommandInOperator(
 		)
 
 		if err != nil {
-			return fmt.Errorf("could not run the command: \"%s\": got an error: %w", command, err)
+			return fmt.Errorf("could not run the command: \"%s\": got an error: %w, stderr: %s", command, err, stderr)
 		}
 
 		return nil
@@ -428,8 +428,11 @@ func (fdbCluster *FdbCluster) GetPodsWithRole(role fdbv1beta2.ProcessRole) []cor
 
 // GetCommandlineForProcessesPerClass fetches the commandline args for all processes except of the specified class.
 func (fdbCluster FdbCluster) GetCommandlineForProcessesPerClass() map[fdbv1beta2.ProcessClass][]string {
-	status := fdbCluster.GetStatus()
+	return fdbCluster.GetCommandlineForProcessesPerClassWithStatus(fdbCluster.GetStatus())
+}
 
+// GetCommandlineForProcessesPerClassWithStatus fetches the commandline args for all processes except of the specified class.
+func (fdbCluster FdbCluster) GetCommandlineForProcessesPerClassWithStatus(status *fdbv1beta2.FoundationDBStatus) map[fdbv1beta2.ProcessClass][]string {
 	knobs := map[fdbv1beta2.ProcessClass][]string{}
 	for _, process := range status.Cluster.Processes {
 		if _, ok := knobs[process.ProcessClass]; !ok {
@@ -487,7 +490,7 @@ func Unprintable(val string) ([]byte, error) {
 		if c == '\\' {
 			i++
 			if i == len(val) {
-				return nil, fmt.Errorf(fmt.Sprintf("end after one \\ when unprint [%s]", val))
+				return nil, fmt.Errorf("end after one \\ when unprint [%s]", val)
 			}
 			switch val[i] {
 			case '\\':
@@ -497,9 +500,7 @@ func Unprintable(val string) ([]byte, error) {
 			case 'x':
 				{
 					if i+2 >= len(val) {
-						return nil, fmt.Errorf(
-							fmt.Sprintf("not have two chars after \\x when unprint [%s]", val),
-						)
+						return nil, fmt.Errorf("not have two chars after \\x when unprint [%s]", val)
 					}
 					d1, err := unhex(val[i+1])
 					if err != nil {
@@ -514,9 +515,7 @@ func Unprintable(val string) ([]byte, error) {
 				}
 			default:
 				{
-					return nil, fmt.Errorf(
-						fmt.Sprintf("after \\ it's neither \\ nor x when unprint %s", val),
-					)
+					return nil, fmt.Errorf("after \\ it's neither \\ nor x when unprint %s", val)
 				}
 			}
 		} else {
@@ -538,5 +537,5 @@ func unhex(c byte) (int, error) {
 		return int(c - 'A' + 10), nil
 	}
 
-	return -1, fmt.Errorf(fmt.Sprintf("failed to unhex %x", c))
+	return -1, fmt.Errorf("failed to unhex %x", c)
 }

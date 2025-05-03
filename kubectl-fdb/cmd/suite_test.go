@@ -4,12 +4,12 @@ import (
 	"context"
 	"testing"
 
-	kubeHelper "github.com/FoundationDB/fdb-kubernetes-operator/internal/kubernetes"
+	kubeHelper "github.com/FoundationDB/fdb-kubernetes-operator/v2/internal/kubernetes"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	mockclient "github.com/FoundationDB/fdb-kubernetes-operator/mock-kubernetes-client/client"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	mockclient "github.com/FoundationDB/fdb-kubernetes-operator/v2/mock-kubernetes-client/client"
 	"k8s.io/client-go/kubernetes/scheme"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -77,6 +77,7 @@ func generateClusterStruct(name string, namespace string) *fdbv1beta2.Foundation
 			ProcessGroupIDPrefix: name,
 		},
 		Status: fdbv1beta2.FoundationDBClusterStatus{
+			ConnectionString: "test:id1234@127.0.0.1:4500",
 			ProcessGroups: []*fdbv1beta2.ProcessGroupStatus{
 				{
 					ProcessGroupID: fdbv1beta2.ProcessGroupID(name + "-" + string(fdbv1beta2.ProcessClassStorage) + "-1"),

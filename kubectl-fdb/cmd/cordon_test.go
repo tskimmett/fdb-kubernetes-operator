@@ -24,7 +24,7 @@ import (
 	"context"
 	"fmt"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -109,7 +109,7 @@ var _ = Describe("[plugin] cordon command", func() {
 					ExpectedInstancesToRemoveWithoutExclusion: []fdbv1beta2.ProcessGroupID{},
 					clusterName:       clusterName,
 					clusterLabel:      "",
-					wantErrorContains: "no pods were found that were running on node",
+					wantErrorContains: "",
 				}),
 			Entry("Cordon no node nodes without exclusion",
 				testCase{
@@ -119,7 +119,7 @@ var _ = Describe("[plugin] cordon command", func() {
 					ExpectedInstancesToRemoveWithoutExclusion: []fdbv1beta2.ProcessGroupID{},
 					clusterName:       clusterName,
 					clusterLabel:      "",
-					wantErrorContains: "no pods were found that were running on node",
+					wantErrorContains: "",
 				}),
 			Entry("Cordon all nodes with exclusion",
 				testCase{
@@ -197,7 +197,7 @@ var _ = Describe("[plugin] cordon command", func() {
 					ExpectedInstancesToRemoveWithoutExclusion: []fdbv1beta2.ProcessGroupID{},
 					clusterName:       "",
 					clusterLabel:      fdbv1beta2.FDBClusterLabel,
-					wantErrorContains: "no pods were found that were running on node",
+					wantErrorContains: "",
 				}),
 		)
 	})

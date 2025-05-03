@@ -17,14 +17,16 @@ limitations under the License.
 package v1beta2
 
 import (
+	"errors"
 	"fmt"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"math"
 	"math/rand"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -69,10 +71,12 @@ var conditionsThatNeedReplacement = []ProcessGroupConditionType{MissingProcesses
 
 const (
 	oneHourDuration = 1 * time.Hour
+)
 
-	// maxProcessGroupIDNum is the upper limit for the process group ID numbers. The picked value should be good enough
+var (
+	// MaxProcessGroupIDNum is the upper limit for the process group ID numbers. The picked value should be good enough
 	// for the current setup but can be increased in the future.
-	maxProcessGroupIDNum = 99999
+	MaxProcessGroupIDNum = 99999
 )
 
 func init() {
@@ -237,7 +241,7 @@ type FoundationDBClusterSpec struct {
 	// Default: split
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Enum=split;unified
-	// +kubebuilder:default:=split
+	// +kubebuilder:default:=unified
 	ImageType *ImageType `json:"imageType,omitempty"`
 
 	// MaxZonesWithUnavailablePods defines the maximum number of zones that can have unavailable pods during the update process.
@@ -251,6 +255,7 @@ type ImageType string
 
 const (
 	// ImageTypeSplit defines the split image type.
+	// Deprecated: New features will only be implemented for the unified.
 	ImageTypeSplit ImageType = "split"
 	// ImageTypeUnified defines the unified image type.
 	ImageTypeUnified ImageType = "unified"
@@ -500,6 +505,16 @@ func (processGroupStatus *ProcessGroupStatus) GetPodName(cluster *FoundationDBCl
 	sb.WriteString(sanitizedProcessGroup[idx:])
 
 	return sb.String()
+}
+
+// GetPvcName returns the PVC name for the associated Process Group. If the process class doesn't use PVCs, an empty
+// string is returned.
+func (processGroupStatus *ProcessGroupStatus) GetPvcName(cluster *FoundationDBCluster) string {
+	if !processGroupStatus.ProcessClass.IsStateful() {
+		return ""
+	}
+
+	return fmt.Sprintf("%s-data", processGroupStatus.GetPodName(cluster))
 }
 
 // NeedsReplacement checks if the ProcessGroupStatus has conditions that require a replacement of the failed Process Group.
@@ -910,6 +925,8 @@ type ProcessGroupConditionType string
 const (
 	// IncorrectPodSpec represents a process group that has an incorrect Pod spec.
 	IncorrectPodSpec ProcessGroupConditionType = "IncorrectPodSpec"
+	// IncorrectPodMetadata represents a process group that has an incorrect Pod metadata (labels and annotations differ).
+	IncorrectPodMetadata ProcessGroupConditionType = "IncorrectPodMetadata"
 	// IncorrectConfigMap represents a process group that has an incorrect ConfigMap.
 	IncorrectConfigMap ProcessGroupConditionType = "IncorrectConfigMap"
 	// IncorrectCommandLine represents a process group that has an incorrect commandline configuration.
@@ -949,6 +966,7 @@ const (
 func AllProcessGroupConditionTypes() []ProcessGroupConditionType {
 	return []ProcessGroupConditionType{
 		IncorrectPodSpec,
+		IncorrectPodMetadata,
 		IncorrectConfigMap,
 		IncorrectCommandLine,
 		PodFailing,
@@ -971,6 +989,8 @@ func GetProcessGroupConditionType(processGroupConditionType string) (ProcessGrou
 	switch processGroupConditionType {
 	case "IncorrectPodSpec":
 		return IncorrectPodSpec, nil
+	case "IncorrectPodMetadata":
+		return IncorrectPodMetadata, nil
 	case "IncorrectConfigMap":
 		return IncorrectConfigMap, nil
 	case "IncorrectCommandLine":
@@ -1190,6 +1210,19 @@ type FoundationDBClusterAutomationOptions struct {
 	// The default is a list that includes "fdb-kubernetes-operator".
 	// +kubebuilder:validation:MaxItems=10
 	IgnoreLogGroupsForUpgrade []LogGroup `json:"ignoreLogGroupsForUpgrade,omitempty"`
+
+	// SynchronizationMode defines the synchronization mode for clusters that are managed by multiple operator instances.
+	// The default is "local" which means all operator instances are only acting on their local processes, with the exception for
+	// cluster upgrades. In the "global" mode the operator instances coordinate actions to only issue a single
+	// exclude/bounce/include to reduce the disruptions. The global coordination mode is based on an optimistic mode
+	// and there are no guarantees that the action will only be executed once, e.g. because of a slow operator instance.
+	//
+	// More details:
+	// https://github.com/FoundationDB/fdb-kubernetes-operator/blob/main/docs/design/better_coordination_multi_operator.md
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=local;global
+	// +kubebuilder:default:=local
+	SynchronizationMode *string `json:"synchronizationMode,omitempty"`
 }
 
 // LogGroup represents a LogGroup used by a FoundationDB process to log trace events. The LogGroup can be used to filter
@@ -1208,7 +1241,7 @@ type MaintenanceModeOptions struct {
 
 	// ResetMaintenanceMode defines whether the operator should reset the maintenance mode if all storage processes
 	// under the maintenance zone have been restarted. The default is false. For more details see:
-	// https://github.com/FoundationDB/fdb-kubernetes-operator/blob/improve-maintenance-mode-integration/docs/manual/operations.md#maintenance
+	// https://github.com/FoundationDB/fdb-kubernetes-operator/v2/blob/improve-maintenance-mode-integration/docs/manual/operations.md#maintenance
 	// Default is false.
 	ResetMaintenanceMode *bool `json:"resetMaintenanceMode,omitempty"`
 
@@ -1353,9 +1386,7 @@ func (cluster *FoundationDBCluster) GetProcessSettings(processClass ProcessClass
 // the UsableRegions is greater than 1. It will be equal to -1 when the
 // UsableRegions is less than or equal to 1.
 func (cluster *FoundationDBCluster) GetRoleCountsWithDefaults() RoleCounts {
-	// We can ignore the error here since the version will be validated in an earlier step.
-	version, _ := ParseFdbVersion(cluster.GetRunningVersion())
-	return cluster.Spec.DatabaseConfiguration.GetRoleCountsWithDefaults(version, cluster.DesiredFaultTolerance())
+	return cluster.Spec.DatabaseConfiguration.GetRoleCountsWithDefaults(cluster.DesiredFaultTolerance())
 }
 
 // calculateProcessCount determines the process count from a given role count.
@@ -1469,12 +1500,7 @@ func (cluster *FoundationDBCluster) GetProcessCountsWithDefaults() (ProcessCount
 		primaryStatelessCount += cluster.calculateProcessCountFromRole(1, processCounts.Ratekeeper) +
 			cluster.calculateProcessCountFromRole(1, processCounts.DataDistributor)
 
-		fdbVersion, err := ParseFdbVersion(cluster.GetRunningVersion())
-		if err != nil {
-			return *processCounts, err
-		}
-
-		if fdbVersion.HasSeparatedProxies() && cluster.Spec.DatabaseConfiguration.AreSeparatedProxiesConfigured() {
+		if cluster.Spec.DatabaseConfiguration.AreSeparatedProxiesConfigured() {
 			primaryStatelessCount += cluster.calculateProcessCountFromRole(roleCounts.GrvProxies, processCounts.GrvProxy)
 			primaryStatelessCount += cluster.calculateProcessCountFromRole(roleCounts.CommitProxies, processCounts.CommitProxy)
 		} else {
@@ -1705,10 +1731,6 @@ func (cluster *FoundationDBCluster) GetLogServersPerPod() int {
 // connection string.
 var alphanum = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-// connectionStringPattern provides a regular expression for parsing the
-// connection string.
-var connectionStringPattern = regexp.MustCompile("(?m)^([^#][^:@]+):([^:@]+)@(.*)$")
-
 // ConnectionString models the contents of a cluster file in a structured way
 type ConnectionString struct {
 	// DatabaseName provides an identifier for the database which persists
@@ -1723,30 +1745,68 @@ type ConnectionString struct {
 	Coordinators []string `json:"coordinators,omitempty"`
 }
 
+// isAlphanumeric regex to validate: value containing alphanumeric characters (a-z, A-Z, 0-9).
+var isAlphanumeric = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
+
+// isAlphanumericWithUnderScore regex to validate: value containing alphanumeric characters (a-z, A-Z, 0-9) and underscores.
+var isAlphanumericWithUnderScore = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+
 // ParseConnectionString parses a connection string from its string
 // representation
 func ParseConnectionString(str string) (ConnectionString, error) {
-	components := connectionStringPattern.FindStringSubmatch(str)
-	if components == nil {
-		return ConnectionString{}, fmt.Errorf("invalid connection string %s", str)
+	firstSplit := strings.SplitN(str, ":", 2)
+	if len(firstSplit) != 2 {
+		return ConnectionString{}, fmt.Errorf("invalid connection string: %s, could not split string to get database description", str)
 	}
 
-	coordinatorsStrings := strings.Split(components[3], ",")
-	coordinators := make([]string, len(coordinatorsStrings))
-	for idx, coordinatorsString := range coordinatorsStrings {
+	// The description is a logical description of the database using alphanumeric characters (a-z, A-Z, 0-9) and underscores.
+	description := firstSplit[0]
+	if !isAlphanumericWithUnderScore.MatchString(description) {
+		return ConnectionString{}, fmt.Errorf("invalid connection string: %s, database description can only contain alphanumeric characters (a-z, A-Z, 0-9) and underscores", str)
+	}
+
+	secondSplit := strings.SplitN(firstSplit[1], "@", 2)
+	if len(secondSplit) != 2 {
+		return ConnectionString{}, fmt.Errorf("invalid connection string: %s, could not split string to get generation ID", str)
+	}
+
+	// The ID is an arbitrary value containing alphanumeric characters (a-z, A-Z, 0-9).
+	generationID := secondSplit[0]
+	if !isAlphanumeric.MatchString(generationID) {
+		return ConnectionString{}, fmt.Errorf("invalid connection string: %s, generation ID can only contain alphanumeric characters (a-z, A-Z, 0-9)", str)
+	}
+
+	coordinatorsStrings := strings.Split(secondSplit[1], ",")
+	coordinators := make([]string, 0, len(coordinatorsStrings))
+	for _, coordinatorsString := range coordinatorsStrings {
 		coordinatorAddress, err := ParseProcessAddress(coordinatorsString)
 		if err != nil {
-			return ConnectionString{}, err
+			return ConnectionString{}, fmt.Errorf("invalid connection string: %s, could not parse coordinator address: %s, got error: %w", str, coordinatorAddress, err)
 		}
 
-		coordinators[idx] = coordinatorAddress.String()
+		coordinators = append(coordinators, coordinatorAddress.String())
+	}
+
+	if len(coordinators) == 0 {
+		return ConnectionString{}, fmt.Errorf("invalid connection string: %s, connection string must contain at least one coordinator", str)
 	}
 
 	return ConnectionString{
-		components[1],
-		components[2],
+		description,
+		generationID,
 		coordinators,
 	}, nil
+}
+
+// SanitizeConnectionStringDescription will replace "-" to "_".
+func SanitizeConnectionStringDescription(str string) string {
+	return strings.ReplaceAll(str, "-", "_")
+}
+
+// Validate will return nil if the connection string is valid or an error if the connection string is not valid.
+func (str *ConnectionString) Validate() error {
+	_, err := ParseConnectionString(str.String())
+	return err
 }
 
 // String formats a connection string as a string
@@ -1876,17 +1936,9 @@ type ContainerOverrides struct {
 // DesiredDatabaseConfiguration builds the database configuration for the
 // cluster based on its spec.
 func (cluster *FoundationDBCluster) DesiredDatabaseConfiguration() DatabaseConfiguration {
-	configuration := cluster.Spec.DatabaseConfiguration.NormalizeConfigurationWithSeparatedProxies(cluster.GetRunningVersion(), cluster.Spec.DatabaseConfiguration.AreSeparatedProxiesConfigured())
+	configuration := cluster.Spec.DatabaseConfiguration.NormalizeConfiguration(cluster)
 	configuration.RoleCounts = cluster.GetRoleCountsWithDefaults()
 	configuration.RoleCounts.Storage = 0
-
-	version, _ := ParseFdbVersion(cluster.GetRunningVersion())
-	if version.HasSeparatedProxies() && cluster.Spec.DatabaseConfiguration.AreSeparatedProxiesConfigured() {
-		configuration.RoleCounts.Proxies = 0
-	} else {
-		configuration.RoleCounts.GrvProxies = 0
-		configuration.RoleCounts.CommitProxies = 0
-	}
 
 	if configuration.StorageEngine == StorageEngineSSD {
 		configuration.StorageEngine = StorageEngineSSD2
@@ -1895,18 +1947,11 @@ func (cluster *FoundationDBCluster) DesiredDatabaseConfiguration() DatabaseConfi
 		configuration.StorageEngine = StorageEngineMemory2
 	}
 
-	// Make sure to reset any settings that are not supported by earlier FDB versions.
-	if !version.SupportsStorageMigrationConfiguration() {
-		configuration.PerpetualStorageWiggle = nil
-		configuration.StorageMigrationType = nil
-		configuration.PerpetualStorageWiggleLocality = nil
-	}
-
 	return configuration
 }
 
-// ClearUnsetDatabaseConfigurationKnobs cleas any knobs that are not set in the FoundationDBCluster spec
-// but which is present in the DatabaseConfiguration returned from the FoundationDBStatus.
+// ClearUnsetDatabaseConfigurationKnobs clears any knobs that are not set in the FoundationDBCluster spec
+// but which are present in the DatabaseConfiguration returned from the FoundationDBStatus.
 func (cluster *FoundationDBCluster) ClearUnsetDatabaseConfigurationKnobs(configuration *DatabaseConfiguration) {
 	// We have to reset the excluded servers here otherwise we will trigger a reconfiguration if one or more servers
 	// are excluded.
@@ -1928,6 +1973,14 @@ func (cluster *FoundationDBCluster) ClearUnsetDatabaseConfigurationKnobs(configu
 
 	if cluster.Spec.DatabaseConfiguration.PerpetualStorageWiggle == nil {
 		configuration.PerpetualStorageWiggle = nil
+	}
+
+	// In case of the proxies, those are always set, even thought if only the GRV/commit proxies should be configured.
+	if cluster.Spec.DatabaseConfiguration.AreSeparatedProxiesConfigured() {
+		configuration.Proxies = 0
+	} else {
+		configuration.CommitProxies = 0
+		configuration.GrvProxies = 0
 	}
 }
 
@@ -2103,8 +2156,7 @@ type RoutingConfig struct {
 
 	// PodIPFamily tells the pod which family of IP addresses to use.
 	// You can use 4 to represent IPv4, and 6 to represent IPv6.
-	// This feature is only supported in FDB 7.0 or later, and requires
-	// dual-stack support in your Kubernetes environment.
+	// This feature requires dual-stack support in your Kubernetes environment.
 	PodIPFamily *int `json:"podIPFamily,omitempty"`
 
 	// UseDNSInClusterFile determines whether to use DNS names rather than IP
@@ -2360,7 +2412,7 @@ func (cluster *FoundationDBCluster) GetUseNonBlockingExcludes() bool {
 	return pointer.BoolDeref(cluster.Spec.AutomationOptions.UseNonBlockingExcludes, false)
 }
 
-// UseLocalitiesForExclusion returns the value of UseLocalitiesForExclusion or false if unset.
+// UseLocalitiesForExclusion returns the value of UseLocalitiesForExclusion or true if unset.
 func (cluster *FoundationDBCluster) UseLocalitiesForExclusion() bool {
 	fdbVersion, err := ParseFdbVersion(cluster.GetRunningVersion())
 	if err != nil {
@@ -2369,7 +2421,7 @@ func (cluster *FoundationDBCluster) UseLocalitiesForExclusion() bool {
 		return false
 	}
 
-	return fdbVersion.SupportsLocalityBasedExclusions() && pointer.BoolDeref(cluster.Spec.AutomationOptions.UseLocalitiesForExclusion, false)
+	return fdbVersion.SupportsLocalityBasedExclusions() && pointer.BoolDeref(cluster.Spec.AutomationOptions.UseLocalitiesForExclusion, true)
 }
 
 // GetProcessClassLabel provides the label that this cluster is using for the
@@ -2422,16 +2474,9 @@ func (cluster *FoundationDBCluster) NeedsHeadlessService() bool {
 	return cluster.DefineDNSLocalityFields() || pointer.BoolDeref(cluster.Spec.Routing.HeadlessService, false)
 }
 
-// UseDNSInClusterFile determines whether we need to use DNS entries in the
-// cluster file for this cluster.
+// UseDNSInClusterFile determines whether we need to use DNS entries in the cluster file for this cluster.
 func (cluster *FoundationDBCluster) UseDNSInClusterFile() bool {
-	runningVersion, err := ParseFdbVersion(cluster.GetRunningVersion())
-	// If the version cannot be parsed fall back to false.
-	if err != nil {
-		return false
-	}
-
-	return runningVersion.SupportsDNSInClusterFile() && pointer.BoolDeref(cluster.Spec.Routing.UseDNSInClusterFile, false)
+	return pointer.BoolDeref(cluster.Spec.Routing.UseDNSInClusterFile, true)
 }
 
 // DefineDNSLocalityFields determines whether we need to put DNS entries in the
@@ -2597,12 +2642,11 @@ func (cluster *FoundationDBCluster) GetSidecarContainerEnableReadinessProbe() bo
 
 // UseUnifiedImage returns true if the unified image should be used.
 func (cluster *FoundationDBCluster) UseUnifiedImage() bool {
-	imageType := ImageTypeSplit
 	if cluster.Spec.ImageType != nil {
-		imageType = *cluster.Spec.ImageType
+		return *cluster.Spec.ImageType == ImageTypeUnified
 	}
 
-	return imageType == ImageTypeUnified
+	return true
 }
 
 // DesiredImageType returns the desired image type that should be used.
@@ -2914,11 +2958,18 @@ func (cluster *FoundationDBCluster) Validate() error {
 		}
 	}
 
+	if cluster.Spec.Routing.PodIPFamily != nil {
+		ipFamily := cluster.GetPodIPFamily()
+		if ipFamily != PodIPFamilyIPv4 && ipFamily != PodIPFamilyIPv6 && ipFamily != PodIPFamilyUnset {
+			validations = append(validations, fmt.Sprintf("Pod IP Family %d is not valid, only 4 or 6 are allowed.", ipFamily))
+		}
+	}
+
 	if len(validations) == 0 {
 		return nil
 	}
 
-	return fmt.Errorf(strings.Join(validations, ", "))
+	return errors.New(strings.Join(validations, ", "))
 }
 
 // IsTaintFeatureDisabled return true if operator is configured to not replace Pods tainted Nodes OR
@@ -2978,19 +3029,26 @@ func (cluster *FoundationDBCluster) GetCurrentProcessGroupsAndProcessCounts() (m
 // GetNextRandomProcessGroupID will return a randomly picked ProcessGroupID, the ID number will be between 1 and maxProcessGroupIDNum.
 // This method makes sure that the returned ProcessGroupID is not in use and not marked to be removed.
 // Using a randomized ProcessGroupID will reduce the risk of reusing the same ProcessGroupID for different process groups, see:
-// https://github.com/FoundationDB/fdb-kubernetes-operator/issues/2071
+// https://github.com/FoundationDB/fdb-kubernetes-operator/v2/issues/2071
 func (cluster *FoundationDBCluster) GetNextRandomProcessGroupID(processClass ProcessClass, processGroupIDs map[int]bool) ProcessGroupID {
+	return cluster.GetNextRandomProcessGroupIDWithExclusions(processClass, processGroupIDs, nil)
+}
+
+// GetNextRandomProcessGroupIDWithExclusions will return a randomly picked ProcessGroupID, the ID number will be between 1 and MaxProcessGroupIDNum.
+// This method makes sure that the returned ProcessGroupID is not in use and not marked to be removed and is not excluded.
+// Using a randomized ProcessGroupID will reduce the risk of reusing the same ProcessGroupID for different process groups, see:
+// https://github.com/FoundationDB/fdb-kubernetes-operator/v2/issues/2071
+func (cluster *FoundationDBCluster) GetNextRandomProcessGroupIDWithExclusions(processClass ProcessClass, processGroupIDs map[int]bool, exclusions map[ProcessGroupID]None) ProcessGroupID {
 	var processGroupID ProcessGroupID
 	for {
-		idNum := rand.Intn(maxProcessGroupIDNum) + 1
+		idNum := rand.Intn(MaxProcessGroupIDNum) + 1
 		// If the randomly picked id number is already is use, pick another one.
 		if _, ok := processGroupIDs[idNum]; ok {
 			continue
 		}
 
 		_, processGroupID = cluster.GetProcessGroupID(processClass, idNum)
-		// If the randomly picked process group is marked for removal, pick another one.
-		if cluster.ProcessGroupIsBeingRemoved(processGroupID) {
+		if !cluster.newProcessGroupIDAllowed(processGroupID, exclusions) {
 			continue
 		}
 
@@ -3001,6 +3059,23 @@ func (cluster *FoundationDBCluster) GetNextRandomProcessGroupID(processClass Pro
 	}
 
 	return processGroupID
+}
+
+// newProcessGroupIDAllowed checks if the provided ProcessGroupID can be used and is not marked for removal or is part
+// of the excluded localities.
+func (cluster *FoundationDBCluster) newProcessGroupIDAllowed(processGroupID ProcessGroupID, exclusions map[ProcessGroupID]None) bool {
+	// If the randomly picked process group is marked for removal, pick another one.
+	if cluster.ProcessGroupIsBeingRemoved(processGroupID) {
+		return false
+	}
+
+	// If the randomly picked process group is part of the locality based exclusions, we shouldn't pick it.
+	// See: https://github.com/FoundationDB/fdb-kubernetes-operator/v2/issues/1862
+	if _, ok := exclusions[processGroupID]; ok {
+		return false
+	}
+
+	return true
 }
 
 // GetNextProcessGroupID will return the next unused ProcessGroupID and the ID number based on the provided ProcessClass
@@ -3035,9 +3110,23 @@ func (cluster *FoundationDBCluster) GetProcessGroupID(processClass ProcessClass,
 	return fmt.Sprintf("%s-%s-%d", cluster.Name, processClass.GetProcessClassForPodName(), idNum), processGroupID
 }
 
+var (
+	// PodIPFamilyUnset represents an unset IP family.
+	PodIPFamilyUnset = 0
+	// PodIPFamilyIPv4 represents the desired IP family as IPv4.
+	PodIPFamilyIPv4 = 4
+	// PodIPFamilyIPv6 represents the desired IP family as IPv6.
+	PodIPFamilyIPv6 = 6
+)
+
+// GetPodIPFamily returns the current desired pod IP family. If no IP family is specified the value will be PodIPFamilyUnset.
+func (cluster *FoundationDBCluster) GetPodIPFamily() int {
+	return pointer.IntDeref(cluster.Spec.Routing.PodIPFamily, PodIPFamilyUnset)
+}
+
 // IsPodIPFamily6 determines whether the podIPFamily setting in cluster is set to use the IPv6 family.
 func (cluster *FoundationDBCluster) IsPodIPFamily6() bool {
-	return pointer.IntDeref(cluster.Spec.Routing.PodIPFamily, 4) == 6
+	return cluster.GetPodIPFamily() == PodIPFamilyIPv6
 }
 
 // ProcessSharesDC returns true if the process's locality matches the cluster's Datacenter.
@@ -3067,4 +3156,34 @@ func (cluster *FoundationDBCluster) GetMaxFaultDomainsWithTaintedProcessGroups(f
 	}
 
 	return maxAllowed, nil
+}
+
+// UpdateAction defines the update action for an entry in the multi-region coordination key-space.
+type UpdateAction string
+
+const (
+	// UpdateActionAdd will add or update the provided information.
+	UpdateActionAdd UpdateAction = "add"
+	// UpdateActionDelete will remove the provided associated information.
+	UpdateActionDelete UpdateAction = "delete"
+)
+
+// SynchronizationMode defines the synchronization mode.
+// +kubebuilder:validation:MaxLength=256
+type SynchronizationMode string
+
+const (
+	// SynchronizationModeLocal defines the local synchronization mode.
+	SynchronizationModeLocal SynchronizationMode = "local"
+	// SynchronizationModeGlobal SynchronizationMode the global synchronization mode.
+	SynchronizationModeGlobal SynchronizationMode = "global"
+)
+
+// GetSynchronizationMode returns the current SynchronizationMode.
+func (cluster *FoundationDBCluster) GetSynchronizationMode() SynchronizationMode {
+	if !cluster.Status.Configured {
+		return SynchronizationModeLocal
+	}
+
+	return SynchronizationMode(pointer.StringDeref(cluster.Spec.AutomationOptions.SynchronizationMode, string(SynchronizationModeLocal)))
 }

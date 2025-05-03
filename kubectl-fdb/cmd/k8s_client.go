@@ -24,13 +24,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	fdbv1beta1 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
 	"io"
-	"k8s.io/client-go/rest"
 	"math/rand"
 	"strings"
+
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
+	"k8s.io/client-go/rest"
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
@@ -67,7 +67,6 @@ func getKubeClient(ctx context.Context, o *fdbBOptions) (client.Client, error) {
 func setupKubeClient(ctx context.Context, config *rest.Config, namespace string) (client.Client, error) {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(fdbv1beta1.AddToScheme(scheme))
 	utilruntime.Must(fdbv1beta2.AddToScheme(scheme))
 
 	// Don't printout any log messages from client-go.

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2023 Apple Inc. and the FoundationDB project authors
+ * Copyright 2018-2025 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,11 +23,18 @@ package fdbstatus
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbadminclient"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbadminclient"
 	"github.com/go-logr/logr"
+)
+
+const (
+	maximumDataLag = 60.0
+	// maximumQueueByteSize is per default 250 MB
+	maximumQueueByteSize = 250 * 1024 * 1024
 )
 
 // forbiddenStatusMessages represents messages that could be part of the machine-readable status. Those messages can represent
@@ -113,7 +120,7 @@ func getRemainingAndExcludedFromStatus(logger logr.Logger, status *fdbv1beta2.Fo
 	for _, process := range status.Cluster.Processes {
 		processAddresses := []string{
 			fmt.Sprintf("%s:%s", fdbv1beta2.FDBLocalityExclusionPrefix, process.Locality[fdbv1beta2.FDBLocalityInstanceIDKey]),
-			process.Address.MachineAddress(),
+			process.Address.IPAddress.String(),
 		}
 
 		// We have to verify the IP address and the locality of this process, if neither should be verified we skip any
@@ -571,7 +578,7 @@ func ConfigurationChangeAllowed(status *fdbv1beta2.FoundationDBStatus, useRecove
 
 	// Check the health of the data distribution before allowing configuration changes.
 	if !status.Cluster.Data.State.Healthy {
-		return fmt.Errorf("data distribution is not healhty: %s", status.Cluster.Data.State.Name)
+		return fmt.Errorf("data distribution is not healthy: %s", status.Cluster.Data.State.Name)
 	}
 
 	// Check if the cluster status messages contain any messages that provide a signal to assume it's not safe
@@ -588,10 +595,97 @@ func ConfigurationChangeAllowed(status *fdbv1beta2.FoundationDBStatus, useRecove
 		return fmt.Errorf("clusters last recovery was %0.2f seconds ago, wait until the last recovery was 60 seconds ago", status.Cluster.RecoveryState.SecondsSinceLastRecovered)
 	}
 
+	return CheckQosStatus(status)
+}
+
+// CheckQosStatus will perform checks on the QoS related metrics from the machine-readable status to validate if certain
+// changes are safe.
+// Check https://apple.github.io/foundationdb/administration.html#machine-readable-status for some additional background
+// information.
+func CheckQosStatus(status *fdbv1beta2.FoundationDBStatus) error {
 	// We picked this value from the FoundationDB implementation, this is the default threshold to report a process as lagging.
-	if status.Cluster.Qos.WorstDataLagStorageServer.Seconds > 60.0 {
-		return fmt.Errorf("data lag is to high to issue configuration change, current data lag in seconds: %0.2f", status.Cluster.Qos.WorstDataLagStorageServer.Seconds)
+	if status.Cluster.Qos.WorstDataLagStorageServer.Seconds > maximumDataLag {
+		return fmt.Errorf("worst data lag is too high, current worst data lag in seconds: %0.2f, maximum allowed lag:  %0.2f", status.Cluster.Qos.WorstDataLagStorageServer.Seconds, maximumDataLag)
+	}
+
+	if status.Cluster.Qos.WorstDurabilityLagStorageServer.Seconds > maximumDataLag {
+		return fmt.Errorf("worst durability lag is too high, current worst durability lag in seconds: %0.2f, maximum allowed lag:  %0.2f", status.Cluster.Qos.WorstDurabilityLagStorageServer.Seconds, maximumDataLag)
+	}
+
+	if status.Cluster.Qos.WorstQueueBytesLogServer > maximumQueueByteSize {
+		return fmt.Errorf("worst queue bytes for log server is too high, current worst queue bytes: %s, maximum allowed queue bytes: %s", PrettyPrintBytes(status.Cluster.Qos.WorstQueueBytesLogServer), PrettyPrintBytes(maximumQueueByteSize))
+	}
+
+	if status.Cluster.Qos.WorstQueueBytesStorageServer > maximumQueueByteSize {
+		return fmt.Errorf("worst queue bytes for storage server is too high, current worst queue bytes: %s, maximum allowed queue bytes: %s", PrettyPrintBytes(status.Cluster.Qos.WorstQueueBytesStorageServer), PrettyPrintBytes(maximumQueueByteSize))
 	}
 
 	return nil
+}
+
+// GetExcludedLocalitiesFromStatus returns the excluded localities based on the machine-readable status. If the provided status is empty a new status is fetched.
+func GetExcludedLocalitiesFromStatus(logger logr.Logger, cluster *fdbv1beta2.FoundationDBCluster, status *fdbv1beta2.FoundationDBStatus, getAdminClient func(logger logr.Logger, cluster *fdbv1beta2.FoundationDBCluster) (fdbadminclient.AdminClient, error)) (map[fdbv1beta2.ProcessGroupID]fdbv1beta2.None, error) {
+	exclusions := map[fdbv1beta2.ProcessGroupID]fdbv1beta2.None{}
+	if cluster.UseLocalitiesForExclusion() {
+		if status == nil {
+			adminClient, err := getAdminClient(logger, cluster)
+			if err != nil {
+				return exclusions, err
+			}
+
+			status, err = adminClient.GetStatus()
+			if err != nil {
+				return exclusions, err
+			}
+		}
+
+		prefix := fdbv1beta2.FDBLocalityExclusionPrefix + ":"
+		for _, excludedServer := range status.Cluster.DatabaseConfiguration.ExcludedServers {
+			if excludedServer.Locality == "" {
+				continue
+			}
+
+			processGroupID, found := strings.CutPrefix(excludedServer.Locality, prefix)
+			if !found {
+				continue
+			}
+			exclusions[fdbv1beta2.ProcessGroupID(processGroupID)] = fdbv1beta2.None{}
+		}
+	}
+
+	return exclusions, nil
+}
+
+// CanSafelyRemoveMaintenanceMode will return true if the maintenance mode can be disabled.
+func CanSafelyRemoveMaintenanceMode(status *fdbv1beta2.FoundationDBStatus) error {
+	err := DefaultSafetyChecks(status, 10, "remove maintenance mode")
+	if err != nil {
+		return err
+	}
+
+	return CheckQosStatus(status)
+}
+
+// PrettyPrintBytes will return a string that represents the storedBytes in a human-readable format.
+func PrettyPrintBytes(bytes int64) string {
+	units := []string{"", "Ki", "Mi", "Gi", "Ti", "Pi"}
+
+	currentBytes := float64(bytes)
+	for _, unit := range units {
+		if currentBytes < 1024 {
+			return fmt.Sprintf("%3.2f%s", currentBytes, unit)
+		}
+
+		currentBytes /= 1024
+	}
+
+	// Fallback will be to printout the bytes.
+	return strconv.FormatInt(bytes, 10)
+}
+
+// ClusterIsConfigured will return true if the cluster is configured based on the machine-readable status of the status of
+// the FoundationDBCLuster resource.
+func ClusterIsConfigured(cluster *fdbv1beta2.FoundationDBCluster, status *fdbv1beta2.FoundationDBStatus) bool {
+	// If we saw at least once that the cluster was configured, we assume that the cluster is always configured.
+	return cluster.Status.Configured || status.Client.DatabaseStatus.Available && status.Cluster.Layers.Error != "configurationMissing"
 }

@@ -26,7 +26,7 @@ import (
 	"fmt"
 	"strings"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 )
 
 // FactoryOptions defines the (command line) options that are support for the e2e test cases.
@@ -49,6 +49,7 @@ type FactoryOptions struct {
 	clusterName                    string
 	storageEngine                  string
 	fdbVersionTagMapping           string
+	synchronizationMode            string
 	enableChaosTests               bool
 	enableDataLoading              bool
 	cleanup                        bool
@@ -57,6 +58,7 @@ type FactoryOptions struct {
 	featureOperatorUnifiedImage    bool
 	featureOperatorServerSideApply bool
 	dumpOperatorState              bool
+	nodeSelector                   string
 }
 
 // BindFlags binds the FactoryOptions flags to the provided FlagSet. This can be used to extend the current test setup
@@ -217,6 +219,18 @@ func (options *FactoryOptions) BindFlags(fs *flag.FlagSet) {
 		"chrislusf/seaweedfs:3.73",
 		"defines the seaweedfs image that should be used for testing. SeaweedFS is used for backup and restore testing to spin up a S3 compatible blobstore.",
 	)
+	fs.StringVar(
+		&options.nodeSelector,
+		"node-selector",
+		"",
+		"if defined, specifies a Kubernetes node selector for the FDB cluster in the format key=value",
+	)
+	fs.StringVar(
+		&options.synchronizationMode,
+		"feature-synchronization-mode",
+		"local",
+		"defines the synchronization mode that should be used. Only applies for multi-region clusters.",
+	)
 }
 
 func (options *FactoryOptions) validateFlags() error {
@@ -281,7 +295,32 @@ func (options *FactoryOptions) validateFlags() error {
 		options.cloudProvider = strings.ToLower(options.cloudProvider)
 	}
 
+	err := options.validateNodeSelector()
+	if err != nil {
+		return err
+	}
+
+	err = options.validateSynchronizationMode()
+	if err != nil {
+		return err
+	}
+
 	return options.validateFDBVersionTagMapping()
+}
+
+func (options *FactoryOptions) validateSynchronizationMode() error {
+	if options.synchronizationMode == "" {
+		options.synchronizationMode = string(fdbv1beta2.SynchronizationModeLocal)
+		return nil
+	}
+
+	options.synchronizationMode = strings.ToLower(options.synchronizationMode)
+	mode := fdbv1beta2.SynchronizationMode(options.synchronizationMode)
+	if mode == fdbv1beta2.SynchronizationModeGlobal || mode == fdbv1beta2.SynchronizationModeLocal {
+		return nil
+	}
+
+	return fmt.Errorf("synchronizationMode must be either \"local\" or \"global\", got :\"%s\"", mode)
 }
 
 func validateVersion(label string, version string) error {
@@ -321,6 +360,17 @@ func (options *FactoryOptions) validateFDBVersionTagMapping() error {
 	return nil
 }
 
+func (options *FactoryOptions) validateNodeSelector() error {
+	if options.nodeSelector == "" {
+		return nil
+	}
+	splitSelector := strings.Split(options.nodeSelector, "=")
+	if len(splitSelector) != 2 {
+		return fmt.Errorf("node selector must have format key=value, got: %s", options.nodeSelector)
+	}
+	return nil
+}
+
 // getTagSuffix returns "-1" if the tag suffix should be used for a sidecar image.
 func getTagSuffix(isSidecar bool) string {
 	if isSidecar {
@@ -333,6 +383,12 @@ func getTagSuffix(isSidecar bool) string {
 // getTagWithSuffix returns the tag with the required suffix if the image is needed for the sidecar image.
 func getTagWithSuffix(tag string, isSidecar bool) string {
 	if tag != "" && isSidecar {
+		tagSuffix := getTagSuffix(isSidecar)
+		// Suffix is already present, so we don't have to add it again.
+		if strings.HasSuffix(tag, tagSuffix) {
+			return tag
+		}
+
 		return tag + getTagSuffix(isSidecar)
 	}
 

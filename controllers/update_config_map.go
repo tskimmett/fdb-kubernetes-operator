@@ -22,16 +22,12 @@ package controllers
 
 import (
 	"context"
-	"reflect"
 
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
 	"github.com/go-logr/logr"
-
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
-
-	"k8s.io/apimachinery/pkg/api/equality"
-
-	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -41,31 +37,32 @@ import (
 type updateConfigMap struct{}
 
 // reconcile runs the reconciler's work.
-func (u updateConfigMap) reconcile(ctx context.Context, r *FoundationDBClusterReconciler, cluster *fdbtypes.FoundationDBCluster, _ *fdbtypes.FoundationDBStatus, logger logr.Logger) *requeue {
+func (u updateConfigMap) reconcile(ctx context.Context, r *FoundationDBClusterReconciler, cluster *fdbv1beta2.FoundationDBCluster, _ *fdbv1beta2.FoundationDBStatus, logger logr.Logger) *requeue {
 	configMap, err := internal.GetConfigMap(cluster)
 	if err != nil {
 		return &requeue{curError: err}
 	}
 	existing := &corev1.ConfigMap{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: configMap.Namespace, Name: configMap.Name}, existing)
-	if err != nil && k8serrors.IsNotFound(err) {
-		logger.V(1).Info("Creating config map", "name", configMap.Name)
-		err = r.Create(ctx, configMap)
-		if err != nil {
-			return &requeue{curError: err}
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			logger.V(1).Info("Creating config map", "name", configMap.Name)
+			err = r.Create(ctx, configMap)
+			if err != nil {
+				return &requeue{curError: err}
+			}
+			return nil
 		}
-		return nil
-	} else if err != nil {
+
 		return &requeue{curError: err}
 	}
 
 	metadataCorrect := true
-	if !reflect.DeepEqual(existing.ObjectMeta.Labels, configMap.ObjectMeta.Labels) {
-		existing.ObjectMeta.Labels = configMap.ObjectMeta.Labels
+	if internal.MergeLabels(&existing.ObjectMeta, configMap.ObjectMeta) {
 		metadataCorrect = false
 	}
 
-	if mergeAnnotations(&existing.ObjectMeta, configMap.ObjectMeta) {
+	if internal.MergeAnnotations(&existing.ObjectMeta, configMap.ObjectMeta) {
 		metadataCorrect = false
 	}
 

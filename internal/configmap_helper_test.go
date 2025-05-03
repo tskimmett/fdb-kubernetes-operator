@@ -23,7 +23,8 @@ package internal
 import (
 	"encoding/json"
 	"fmt"
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	monitorapi "github.com/apple/foundationdb/fdbkubernetesmonitor/api"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -311,20 +312,6 @@ var _ = Describe("configmap_helper", func() {
 				Expect(configMap.Annotations).To(Equal(map[string]string{
 					"fdb-annotation": "value1",
 				}))
-			})
-		})
-
-		Context("with a custom configmap", func() {
-			BeforeEach(func() {
-				cluster.Spec.ConfigMap = &corev1.ConfigMap{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "name1",
-					},
-				}
-			})
-
-			It("should use the configmap name as suffix", func() {
-				Expect(configMap.Name).To(Equal(fmt.Sprintf("%s-%s", cluster.Name, "name1")))
 			})
 		})
 

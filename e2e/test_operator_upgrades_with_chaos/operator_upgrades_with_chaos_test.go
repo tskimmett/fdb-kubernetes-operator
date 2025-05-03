@@ -33,8 +33,8 @@ import (
 	"strings"
 	"time"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/e2e/fixtures"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/e2e/fixtures"
 	chaosmesh "github.com/chaos-mesh/chaos-mesh/api/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -433,8 +433,14 @@ var _ = Describe("Operator Upgrades with chaos-mesh", Label("e2e", "pr"), func()
 			}
 			faultyProcessGroupID := fixtures.GetProcessGroupID(faultyPod)
 
+			creationTimestamp := faultyPod.CreationTimestamp
 			// The upgrade will be stuck until the new fdbserver binary is copied to the shared directory again.
 			Eventually(func() bool {
+				currentPod := fdbCluster.GetPod(faultyPod.Name)
+				if creationTimestamp.Compare(currentPod.CreationTimestamp.Time) != 0 {
+					Skip("Faulty Pod was deleted, skipping test as the test setup failed.")
+				}
+
 				cluster := fdbCluster.GetCluster()
 				for _, processGroup := range cluster.Status.ProcessGroups {
 					if processGroup.ProcessGroupID != faultyProcessGroupID {

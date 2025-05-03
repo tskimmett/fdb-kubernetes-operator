@@ -28,69 +28,55 @@ import (
 	"net"
 	"strconv"
 
+	monitorapi "github.com/apple/foundationdb/fdbkubernetesmonitor/api"
+
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	"github.com/go-logr/logr"
-
-	"k8s.io/utils/pointer"
-
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // GetPublicIPsForPod returns the public IPs for a Pod
 func GetPublicIPsForPod(pod *corev1.Pod, log logr.Logger) []string {
-	var podIPFamily *int
-
 	if pod == nil {
 		return []string{}
 	}
 
-	for _, container := range pod.Spec.Containers {
-		if container.Name != fdbv1beta2.SidecarContainerName {
+	podIPFamily, err := GetIPFamily(pod)
+	if err != nil {
+		log.Error(err, "Could not parse IP family")
+		return []string{pod.Status.PodIP}
+	}
+
+	if podIPFamily == fdbv1beta2.PodIPFamilyUnset {
+		return []string{pod.Status.PodIP}
+	}
+
+	podIPs := pod.Status.PodIPs
+	matchingIPs := make([]string, 0, len(podIPs))
+	for _, podIP := range podIPs {
+		ip := net.ParseIP(podIP.IP)
+		if ip == nil {
+			log.Error(nil, "Failed to parse IP from pod", "ip", podIP)
 			continue
 		}
-		for indexOfArgument, argument := range container.Args {
-			if argument == "--public-ip-family" && indexOfArgument < len(container.Args)-1 {
-				familyString := container.Args[indexOfArgument+1]
-				family, err := strconv.Atoi(familyString)
-				if err != nil {
-					log.Error(err, "Error parsing public IP family", "family", familyString)
-					return nil
-				}
-				podIPFamily = &family
-				break
-			}
+		matches := false
+		switch podIPFamily {
+		case fdbv1beta2.PodIPFamilyIPv4:
+			matches = ip.To4() != nil
+		case fdbv1beta2.PodIPFamilyIPv6:
+			matches = ip.To4() == nil
+		default:
+			log.Error(nil, "Could not match IP address against IP family", "family", podIPFamily)
+		}
+		if matches {
+			matchingIPs = append(matchingIPs, podIP.IP)
 		}
 	}
 
-	if podIPFamily != nil {
-		podIPs := pod.Status.PodIPs
-		matchingIPs := make([]string, 0, len(podIPs))
-
-		for _, podIP := range podIPs {
-			ip := net.ParseIP(podIP.IP)
-			if ip == nil {
-				log.Error(nil, "Failed to parse IP from pod", "ip", podIP)
-				continue
-			}
-			matches := false
-			switch *podIPFamily {
-			case 4:
-				matches = ip.To4() != nil
-			case 6:
-				matches = ip.To4() == nil
-			default:
-				log.Error(nil, "Could not match IP address against IP family", "family", *podIPFamily)
-			}
-			if matches {
-				matchingIPs = append(matchingIPs, podIP.IP)
-			}
-		}
-		return matchingIPs
-	}
-
-	return []string{pod.Status.PodIP}
+	return matchingIPs
 }
 
 // GetProcessGroupIDFromMeta fetches the process group ID from an object's metadata.
@@ -237,6 +223,82 @@ func GetPublicIPSource(pod *corev1.Pod) (fdbv1beta2.PublicIPSource, error) {
 	return fdbv1beta2.PublicIPSource(source), nil
 }
 
+// getIPFamilyFromPod returns the IP family from the pod configuration.
+func getIPFamilyFromPod(pod *corev1.Pod) (int, error) {
+	if GetImageType(pod) == fdbv1beta2.ImageTypeUnified {
+		currentData, present := pod.Annotations[monitorapi.CurrentConfigurationAnnotation]
+		if !present {
+			return fdbv1beta2.PodIPFamilyUnset, fmt.Errorf("could not read current launcher configuration")
+		}
+
+		currentConfiguration := monitorapi.ProcessConfiguration{}
+		err := json.Unmarshal([]byte(currentData), &currentConfiguration)
+		if err != nil {
+			return fdbv1beta2.PodIPFamilyUnset, fmt.Errorf("could not parse current process configuration: %w", err)
+		}
+
+		for _, argument := range currentConfiguration.Arguments {
+			if argument.ArgumentType != monitorapi.IPListArgumentType {
+				continue
+			}
+
+			return validateIPFamily(argument.IPFamily)
+		}
+
+		// No IP List setting is defined.
+		return fdbv1beta2.PodIPFamilyUnset, nil
+	}
+
+	for _, container := range pod.Spec.Containers {
+		if container.Name != fdbv1beta2.SidecarContainerName {
+			continue
+		}
+
+		for indexOfArgument, argument := range container.Args {
+			if argument == "--public-ip-family" && indexOfArgument < len(container.Args)-1 {
+				return parseIPFamily(container.Args[indexOfArgument+1])
+			}
+		}
+	}
+
+	return fdbv1beta2.PodIPFamilyUnset, nil
+}
+
+// validateIPFamily will validate that the IP family is valid and return a pointer.
+func validateIPFamily(ipFamily int) (int, error) {
+	if ipFamily != fdbv1beta2.PodIPFamilyIPv4 && ipFamily != fdbv1beta2.PodIPFamilyIPv6 && ipFamily != fdbv1beta2.PodIPFamilyUnset {
+		return fdbv1beta2.PodIPFamilyUnset, fmt.Errorf("unsupported IP family %d", ipFamily)
+	}
+
+	return ipFamily, nil
+}
+
+// parseIPFamily will convert a string into the IP family (int pointer) and validate that the value is a valid IP family.
+func parseIPFamily(ipFamilyValue string) (int, error) {
+	ipFamily, err := strconv.Atoi(ipFamilyValue)
+	if err != nil {
+		return fdbv1beta2.PodIPFamilyUnset, err
+	}
+
+	return validateIPFamily(ipFamily)
+}
+
+// GetIPFamily determines the IP family based on the annotation. If the annotation is not present the method will try to
+// get the ip family based on the pod spec.
+func GetIPFamily(pod *corev1.Pod) (int, error) {
+	if pod == nil {
+		return fdbv1beta2.PodIPFamilyUnset, fmt.Errorf("failed to fetch IP family from nil Pod")
+	}
+
+	ipFamilyValue, ok := pod.ObjectMeta.Annotations[fdbv1beta2.IPFamilyAnnotation]
+	if ipFamilyValue != "" && ok {
+		return parseIPFamily(ipFamilyValue)
+	}
+
+	// If the annotation is missing, try to get the pod IP family from the pod spec.
+	return getIPFamilyFromPod(pod)
+}
+
 // PodHasSidecarTLS determines whether a pod currently has TLS enabled for the sidecar process.
 // This method should only be used for split images.
 func PodHasSidecarTLS(pod *corev1.Pod) bool {
@@ -251,4 +313,99 @@ func PodHasSidecarTLS(pod *corev1.Pod) bool {
 	}
 
 	return false
+}
+
+// PodMetadataCorrect validates if the current pod metadata is correct or if the Pod metadata must be updated.
+func PodMetadataCorrect(cluster *fdbv1beta2.FoundationDBCluster, processGroup *fdbv1beta2.ProcessGroupStatus, pod *corev1.Pod) (bool, error) {
+	correct, err := podMetadataCorrect(GetPodMetadata(cluster, processGroup.ProcessClass, processGroup.ProcessGroupID, ""), pod)
+	if err != nil {
+		return false, err
+	}
+
+	return correct, nil
+}
+
+func podMetadataCorrect(desiredMetadata metav1.ObjectMeta, pod *corev1.Pod) (bool, error) {
+	if desiredMetadata.Annotations == nil {
+		desiredMetadata.Annotations = make(map[string]string, 1)
+	}
+
+	if pod.Spec.NodeName != "" {
+		desiredMetadata.Annotations[fdbv1beta2.NodeAnnotation] = pod.Spec.NodeName
+	}
+
+	// Ignore the fdbv1beta2.LastSpecKey, this value will be updated by replacing or recreating pods.
+	desiredMetadata.Annotations[fdbv1beta2.LastSpecKey] = pod.ObjectMeta.Annotations[fdbv1beta2.LastSpecKey]
+	// Don't change the annotation for the image type, this will require a pod update.
+	desiredMetadata.Annotations[fdbv1beta2.ImageTypeAnnotation] = string(GetImageTypeFromAnnotation(pod.ObjectMeta.Annotations))
+	// Don't change the IP family annotation, this will require a pod update.
+	ipFamily, err := GetIPFamily(pod)
+	if err != nil {
+		return false, err
+	}
+	desiredMetadata.Annotations[fdbv1beta2.IPFamilyAnnotation] = strconv.Itoa(ipFamily)
+
+	return MetadataCorrect(desiredMetadata, &pod.ObjectMeta), nil
+}
+
+// MetadataCorrect validates if the current metadata has the desired annotations and labels.
+func MetadataCorrect(desiredMetadata metav1.ObjectMeta, currentMetadata *metav1.ObjectMeta) bool {
+	// If the annotations or labels have changed the metadata has to be updated.
+	return !MergeLabels(currentMetadata, desiredMetadata) && !MergeAnnotations(currentMetadata, desiredMetadata)
+}
+
+// MetadataMatches determines if the current metadata on an object matches the
+// metadata specified by the cluster spec.
+func MetadataMatches(currentMetadata metav1.ObjectMeta, desiredMetadata metav1.ObjectMeta) bool {
+	return containsAll(currentMetadata.Labels, desiredMetadata.Labels) && containsAll(currentMetadata.Annotations, desiredMetadata.Annotations)
+}
+
+// MergeLabels merges the labels specified by the operator into
+// on object's metadata.
+//
+// This will return whether the target's labels have changed.
+func MergeLabels(target *metav1.ObjectMeta, desired metav1.ObjectMeta) bool {
+	if target.Labels == nil && len(desired.Labels) > 0 {
+		target.Labels = map[string]string{}
+	}
+
+	return mergeMap(target.Labels, desired.Labels)
+}
+
+// MergeAnnotations merges the annotations specified by the operator into
+// on object's metadata.
+//
+// This will return whether the target's annotations have changed.
+func MergeAnnotations(target *metav1.ObjectMeta, desired metav1.ObjectMeta) bool {
+	if target.Annotations == nil && len(desired.Annotations) > 0 {
+		target.Annotations = map[string]string{}
+	}
+
+	return mergeMap(target.Annotations, desired.Annotations)
+}
+
+// mergeMap merges a map into another map.
+//
+// This will return whether the target's values have changed.
+func mergeMap(target map[string]string, desired map[string]string) bool {
+	changed := false
+	for key, value := range desired {
+		if target[key] != value {
+			target[key] = value
+			changed = true
+		}
+	}
+	return changed
+}
+
+// containsAll determines if one map contains all the keys and matching values
+// from another map.
+func containsAll(current map[string]string, desired map[string]string) bool {
+	for key, value := range desired {
+		if current[key] != value {
+			return false
+		}
+	}
+
+	return true
 }

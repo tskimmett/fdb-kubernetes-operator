@@ -1,9 +1,9 @@
 /*
- * none.go
+ * suite_test.go
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2021 Apple Inc. and the FoundationDB project authors
+ * Copyright 2018-2024 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,8 +18,18 @@
  * limitations under the License.
  */
 
-package v1beta1
+package operator
 
-// None is a simple struct to create a set to indicate the value of the map
-// has no meaning.
-type None struct{}
+import (
+	"testing"
+	"time"
+
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/e2e/fixtures"
+	"github.com/onsi/gomega"
+)
+
+func TestOperator(t *testing.T) {
+	gomega.SetDefaultEventuallyTimeout(10 * time.Second)
+	fixtures.SetTestSuiteName("operator-test-3dh")
+	fixtures.RunGinkgoTests(t, "Operator three data hall test suite")
+}

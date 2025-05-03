@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2018-2021 Apple Inc. and the FoundationDB project authors
+ * Copyright 2018-2025 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@
 package fdbadminclient
 
 import (
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 )
 
 // LockClient provides a client for getting locks on operations for a cluster.
@@ -30,7 +30,7 @@ type LockClient interface {
 	Disabled() bool
 
 	// TakeLock attempts to acquire a lock.
-	TakeLock() (bool, error)
+	TakeLock() error
 
 	// ReleaseLock will release the current lock. The method will only release the lock if the current
 	// operator is the lock holder.

@@ -38,7 +38,7 @@ import (
 
 	"k8s.io/client-go/util/retry"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -676,6 +676,7 @@ func (fdbCluster *FdbCluster) SetTransactionServerPerPod(
 
 // ReplacePod replaces the provided Pod if it's part of the FoundationDBCluster.
 func (fdbCluster *FdbCluster) ReplacePod(pod corev1.Pod, waitForReconcile bool) {
+	cluster := fdbCluster.GetCluster()
 	fdbCluster.cluster.Spec.ProcessGroupsToRemove = []fdbv1beta2.ProcessGroupID{GetProcessGroupID(pod)}
 	fdbCluster.UpdateClusterSpec()
 
@@ -683,7 +684,7 @@ func (fdbCluster *FdbCluster) ReplacePod(pod corev1.Pod, waitForReconcile bool) 
 		return
 	}
 
-	gomega.Expect(fdbCluster.WaitForReconciliation(SoftReconcileOption(true))).NotTo(gomega.HaveOccurred())
+	gomega.Expect(fdbCluster.WaitForReconciliation(SoftReconcileOption(true), MinimumGenerationOption(cluster.Generation+1))).NotTo(gomega.HaveOccurred())
 }
 
 // ReplacePods replaces the provided Pods in the current FoundationDBCluster.
@@ -1137,17 +1138,21 @@ func (fdbCluster *FdbCluster) HasHeadlessService() bool {
 
 // SetCustomParameters allows to set the custom parameters of the provided process class.
 func (fdbCluster *FdbCluster) SetCustomParameters(
-	processClass fdbv1beta2.ProcessClass,
-	customParameters fdbv1beta2.FoundationDBCustomParameters,
+	customParameters map[fdbv1beta2.ProcessClass]fdbv1beta2.FoundationDBCustomParameters,
 	waitForReconcile bool,
 ) error {
-	setting, ok := fdbCluster.cluster.Spec.Processes[processClass]
-	if !ok {
-		return fmt.Errorf("could not find process settings for process class %s", processClass)
-	}
-	setting.CustomParameters = customParameters
+	cluster := fdbCluster.GetCluster()
 
-	fdbCluster.cluster.Spec.Processes[processClass] = setting
+	for processClass, parameters := range customParameters {
+		setting, ok := cluster.Spec.Processes[processClass]
+		if !ok {
+			return fmt.Errorf("could not find process settings for process class %s", processClass)
+		}
+		setting.CustomParameters = parameters
+
+		cluster.Spec.Processes[processClass] = setting
+	}
+
 	fdbCluster.UpdateClusterSpec()
 	if !waitForReconcile {
 		return nil
@@ -1306,17 +1311,23 @@ func (fdbCluster *FdbCluster) SetIgnoreDuringRestart(processes []fdbv1beta2.Proc
 	gomega.Expect(fdbCluster.WaitForReconciliation()).NotTo(gomega.HaveOccurred())
 }
 
-// UpdateContainerImage sets the image for the provided Pod for the porvided container.
+// UpdateContainerImage sets the image for the provided Pod for the provided container.
 func (fdbCluster *FdbCluster) UpdateContainerImage(pod *corev1.Pod, containerName string, image string) {
-	for idx, container := range pod.Spec.Containers {
-		if container.Name != containerName {
-			continue
+	gomega.Eventually(func(g gomega.Gomega) error {
+		updatePod := &corev1.Pod{}
+
+		g.Expect(fdbCluster.getClient().Get(context.Background(), client.ObjectKeyFromObject(pod), updatePod)).To(gomega.Succeed())
+
+		for idx, container := range updatePod.Spec.Containers {
+			if container.Name != containerName {
+				continue
+			}
+
+			updatePod.Spec.Containers[idx].Image = image
 		}
 
-		pod.Spec.Containers[idx].Image = image
-	}
-
-	gomega.Expect(fdbCluster.factory.GetControllerRuntimeClient().Update(context.Background(), pod)).NotTo(gomega.HaveOccurred())
+		return fdbCluster.factory.GetControllerRuntimeClient().Update(context.Background(), updatePod)
+	}).ShouldNot(gomega.HaveOccurred())
 }
 
 // SetBuggifyBlockRemoval will set the provided list of process group IDs to be blocked for removal.
@@ -1445,7 +1456,7 @@ func (fdbCluster *FdbCluster) EnsureTeamTrackersAreHealthy() {
 		}
 
 		return true
-	}).WithTimeout(1 * time.Minute).WithPolling(1 * time.Second).MustPassRepeatedly(5).Should(gomega.BeTrue())
+	}).WithTimeout(2 * time.Minute).WithPolling(1 * time.Second).MustPassRepeatedly(5).Should(gomega.BeTrue())
 }
 
 // EnsureTeamTrackersHaveMinReplicas will check if the machine-readable status suggest that the team trackers min_replicas

@@ -131,64 +131,95 @@ This strategy uses the pod name as the fault domain, which allows each process t
 
 ## Three-Data-Hall Replication
 
-**NOTE**: The support for this redundancy mode is new and might have issues. Please make sure you test this configuration in your test/QA environment.
 The [three-data-hall](https://apple.github.io/foundationdb/configuration.html#single-datacenter-modes) replication can be used to replicate data across three data halls, or availability zones.
 This requires that your fault domains are properly labeled on the Kubernetes nodes.
 Most cloud-providers will use the well-known label [topology.kubernetes.io/zone](https://kubernetes.io/docs/reference/labels-annotations-taints/#topologykubernetesiozone) for this.
-When creating a three-data-hall replicated FoundationDBCluster on Kubernetes we have to create 3 `FoundationDBCluster` resources.
-**NOTE**: This is a limitation of the current approach not to read any information from the Kubernetes nodes and simplify the scheduling logic of the operator.
-In the future, this might change and the deployment model for a three-data-hall FoundationDB cluster will be simplified.
-
-We have to start with a simple `FoundationDBCluster` that is running in one single availability zone, e.g. `az1`:
-
-```yaml
-apiVersion: apps.foundationdb.org/v1beta2
-kind: FoundationDBCluster
-metadata:
-  name: sample-cluster-az1
-spec:
-  version: 7.1.26
-  spec:
-    processGroupIDPrefix: az1
-    dataHall: az1
-    databaseConfiguration:
-      redundancy_mode: triple
-    processes:
-      general:
-        podTemplate:
-          spec:
-            nodeSelector:
-              "topology.kubernetes.io/zone": "az1"
-```
-
-Once the cluster in `az1` is reconciled and running we can change the `redundancy_mode` to `three_data_hall`.
-For the other two created `FoundationDBCluster` resources you have to set the `seedConnectionString` to the current connection string of the `FoundationDBCluster` resource in az1.
-The cluster will be stuck in a reconciling state until the other two `FoundationDBClusters`'s in `az2` and `az3` are created:
+**NOTE**: This setup expects that the `unified` image is used with the operator version `v1.53.0` or newer.
+The setup requires that the `fdb-kubernetes-monitor` is able to read node resources to get the node label from them.
+The [rbac setup](../../config/tests/three_data_hall/unified_image_role.yaml) can be used for this.
+We then just create a FoundationDBCluster that the operator will spread across the availability zones.
 
 ```yaml
 apiVersion: apps.foundationdb.org/v1beta2
 kind: FoundationDBCluster
 metadata:
-  name: sample-cluster-az1
+  labels:
+    cluster-group: test-cluster
+  name: sample-cluster
 spec:
-  version: 7.1.26
-  spec:
-    dataHall: az1
-    processGroupIDPrefix: az1
-    databaseConfiguration:
-      redundancy_mode: three_data_hall
-    seedConnectionString: ""
-    processes:
-      general:
-        podTemplate:
-          spec:
-            nodeSelector:
-              "topology.kubernetes.io/zone": "az1"
+  # The unified image supports to make use of node labels, so setting up a three data hall cluster
+  # is easier with the unified image.
+  imageType: unified
+  version: 7.1.63
+  faultDomain:
+    key: kubernetes.io/hostname
+  processCounts:
+    stateless: -1
+  databaseConfiguration:
+    # Ensure that enough coordinators are available. The processes will be spread across the different zones.
+    logs: 9
+    storage: 9
+    redundancy_mode: "three_data_hall"
+  processes:
+    general:
+      customParameters:
+        # This is a special env variables that will be updated by the fdb-kubernetes-monitor.
+        - "locality_data_hall=$NODE_LABEL_TOPOLOGY_KUBERNETES_IO_ZONE"
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: "16G"
+      podTemplate:
+        spec:
+          securityContext:
+            runAsUser: 4059
+            runAsGroup: 4059
+            fsGroup: 4059
+          serviceAccount: fdb-kubernetes
+          # Make sure that the pods are spread equally across the different availability zones.
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: topology.kubernetes.io/zone
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  foundationdb.org/fdb-cluster-name: sample-cluster
+                  # This must be repeated for the other process classes with the correct
+                  # process class.
+                  foundationdb.org/fdb-process-class: general
+          containers:
+            - name: foundationdb
+              env:
+                # This feature allows the fdb-kubernetes-monitor to read the labels from the node where
+                # it is running.
+                - name: ENABLE_NODE_WATCH
+                  value: "true"
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 128Mi
 ```
 
-Once all three `FoundationDBCluster` resources are marked as reconciled the FoundationDB cluster is up and running.
-You can run this configuration in the same namespace, different namespaces or even across multiple different Kubernetes clusters.
-Operations across the different `FoundationDBCluster` resources are [coordinated](#coordinating-global-operations). 
+### Migrating an existing cluster to Three-Data-Hall Replication
+
+NOTE: these steps are for the `split` image setup, which is still the default; for the `unified` image setup migration path is simpler.
+
+It is possible to gracefully migrate a cluster in single, double or triple replication to Three-Data-Hall replication by following these steps:
+
+1. create 3 exact clones of the original k8s FoundationDB cluster object (thus still with same replication) and change these fields: `metadata.name`,`spec.processGroupIDPrefix`, `spec.dataHall`, `spec.dataCenter`
+2. make sure that `skip: true` is set on their YAML definition so that operator will not attempt to configure them
+3. make sure that `seedConnectionString:` is set to to the current connection string of the original cluster
+4. run `kubectl create` for each of them
+5. set the configured state and connection string in their status subresource by using: `kubectl patch fdb my-new-cluster-a --type=merge --subresource status --patch "status: {configured: true, connectionString: \"...\" }"`; use the original cluster connection string here
+6. set `skip: false` on each of the 3 new clusters, and then wait for reconciliation to finish
+7. start a lengthy exclude procedure that will exclude all the processes of the original cluster; suggested order: `log`, `storage`, `coordinator`, `stateless`
+8. delete the original cluster once all exclusions are complete
+9. set `redundancyMode` to `three_data_hall` for the 3 new FoundationDB clusters, one after another
+10. patch seed connection string of 2 of the 3 new clusters to point to the third one e.g. if you have created clusters A,B,C, set the seed connection string of B and C to point to A and make sure that A has no seed connection string; this step is not crucial but practically helpful sometimes
+11. scale down clusters to use 1/3 of the original resources (each of them needs only 3 coordinators and 1/3 of the resources used for other classes)
+
+This procedure mitigates temporary issues (`1031` timeouts) which may happen with sustained traffic when data distributor and master are being reallocated while redundancy mode is changed and/or data is being moved.
 
 ## Multi-Region Replication
 
@@ -281,7 +312,7 @@ spec:
             satellite: 1
 ```
 
-## Coordinating Global Operations
+## Coordinating Global
 
 When running a FoundationDB cluster that is deployed across multiple Kubernetes clusters, each Kubernetes cluster will have its own instance of the operator working on the processes in its cluster.
 There will be some operations that cannot be scoped to a single Kubernetes cluster, such as changing the database configuration.
@@ -305,7 +336,19 @@ The operator will use the locking system to coordinate this.
 Each instance of the operator will store records indicating what processes it is managing and what version they will be running after the restart.
 Each instance will then try to acquire a lock and confirm that every process reporting to the cluster is ready for the upgrade.
 If all processes are prepared, the operator will restart all of them at once.
-If any instance of the operator is stuck and unable to prepare its processes for the upgrade, the restart will not occur.g
+If any instance of the operator is stuck and unable to prepare its processes for the upgrade, the restart will not occur.
+
+
+### Synchronization Mode For Coordination 
+
+The operator supports two different synchronization modes for coordination in mutli-region clusters, `local` (default) and `global`.
+When the synchronization mode is set to `local`, the operator will act only with its local information on actions like a restart, exclude, include and coordinator change.
+With this mode, rolling out a new knob will cause multiple recoveries as each local operator instance will restart the "local" processes independently synchronized by the locking system.
+
+With the synchronization mode set to `global`, the operator tries to coordinate the actions across the Kubernetes clusters.
+The coordination is based on an optimistic coordination system where the operator is adding additional information in FDB to coordinate, for more information see [better coordination for multi-cluster operator](https://github.com/FoundationDB/fdb-kubernetes-operator/blob/main/docs/design/better_coordination_multi_operator.md).
+When doing operations only in a single Kubernetes cluster, e.g. doing a replacement of a single process group, the operation might be slowed down by the coordination overhead, as the operation can not differentiate between a `local` and `global` operation.
+The trade-off here is that `local` actions might be a bit slower but `global` operations, e.g. like a knob rollout, will be faster and less disruptive.
 
 ### Deny List
 
@@ -348,7 +391,7 @@ Once that change is fully reconciled, you can clear the deny list from the spec.
 
 [Pod disruption budgets](https://kubernetes.io/docs/tasks/run-application/configure-pdb/)
 are a good idea to prevent simultaneous disruption to many components in a
-cluster, particularly during the upgrade of nodepools in public clouds. The
+cluster, particularly during the upgrade of node pools in public clouds. The
 operator does not yet create these automatically. To aid in creation of PDBs the
 operator preferentially selects coordinators from just storage pods, then if
 there are not enough storage pods, or the storage pods are not spread across

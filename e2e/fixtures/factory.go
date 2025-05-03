@@ -31,8 +31,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	kubeHelper "github.com/FoundationDB/fdb-kubernetes-operator/internal/kubernetes"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	kubeHelper "github.com/FoundationDB/fdb-kubernetes-operator/v2/internal/kubernetes"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -169,8 +169,7 @@ func (factory *Factory) CreateFdbCluster(
 	config *ClusterConfig,
 	options ...ClusterOption,
 ) *FdbCluster {
-	spec := factory.GenerateFDBClusterSpec(config)
-	return factory.CreateFdbClusterFromSpec(spec, config, options...)
+	return factory.CreateFdbClusterFromSpec(factory.GenerateFDBClusterSpec(config), config, options...)
 }
 
 // CreateFdbClusterFromSpec creates a FDB cluster. This method can be used in combination with the GenerateFDBClusterSpec method.
@@ -585,7 +584,7 @@ func writePodInformation(pod corev1.Pod) string {
 	buffer.WriteString(strconv.Itoa(containers))
 	buffer.WriteString("\t")
 	buffer.WriteString(string(pod.Status.Phase))
-
+	buffer.WriteString("\t")
 	if pod.Status.Phase == corev1.PodPending {
 		for _, condition := range pod.Status.Conditions {
 			// Only check the PodScheduled condition.
@@ -595,12 +594,11 @@ func writePodInformation(pod corev1.Pod) string {
 
 			// If the Pod is scheduled we can ignore this condition.
 			if condition.Status == corev1.ConditionTrue {
-				buffer.WriteString("\t-")
+				buffer.WriteString("-")
 				continue
 			}
 
 			// Printout the message, why the Pod is not scheduling.
-			buffer.WriteString("\t")
 			if condition.Message != "" {
 				buffer.WriteString(condition.Message)
 			} else {
@@ -608,7 +606,7 @@ func writePodInformation(pod corev1.Pod) string {
 			}
 		}
 	} else {
-		buffer.WriteString("\t-")
+		buffer.WriteString("-")
 	}
 
 	buffer.WriteString("\t")
@@ -879,4 +877,22 @@ func (factory *Factory) getStorageEngine() fdbv1beta2.StorageEngine {
 // Intn wrapper around Intn with the current random generator of the factory.
 func (factory *Factory) Intn(n int) int {
 	return factory.randomGenerator.Intn(n)
+}
+
+// GetNodeSelector returns the node selector, which is an empty string or has the format key=value.
+func (factory *Factory) GetNodeSelector() string {
+	if factory == nil {
+		return ""
+	}
+	return factory.options.nodeSelector
+}
+
+// GetSynchronizationMode returns the desired fdbv1beta2.SynchronizationMode if unset, the default will be
+// fdbv1beta2.SynchronizationModeLocal.
+func (factory *Factory) GetSynchronizationMode() fdbv1beta2.SynchronizationMode {
+	if factory.options.synchronizationMode == "" {
+		return fdbv1beta2.SynchronizationModeLocal
+	}
+
+	return fdbv1beta2.SynchronizationMode(factory.options.synchronizationMode)
 }

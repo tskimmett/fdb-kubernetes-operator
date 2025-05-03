@@ -23,26 +23,36 @@ package controllers
 import (
 	"context"
 	"fmt"
+
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbstatus"
 	"github.com/go-logr/logr"
 
 	corev1 "k8s.io/api/core/v1"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
 )
 
 // addProcessGroups provides a reconciliation step for adding new pods to a cluster.
 type addProcessGroups struct{}
 
 // reconcile runs the reconciler's work.
-func (a addProcessGroups) reconcile(ctx context.Context, r *FoundationDBClusterReconciler, cluster *fdbv1beta2.FoundationDBCluster, _ *fdbv1beta2.FoundationDBStatus, logger logr.Logger) *requeue {
+func (a addProcessGroups) reconcile(ctx context.Context, r *FoundationDBClusterReconciler, cluster *fdbv1beta2.FoundationDBCluster, status *fdbv1beta2.FoundationDBStatus, logger logr.Logger) *requeue {
 	desiredCountStruct, err := cluster.GetProcessCountsWithDefaults()
 	if err != nil {
 		return &requeue{curError: err}
 	}
+
 	desiredCounts := desiredCountStruct.Map()
 	processCounts, processGroupIDs, err := cluster.GetCurrentProcessGroupsAndProcessCounts()
 	if err != nil {
 		return &requeue{curError: err}
+	}
+
+	// Fetch the excluded localities from the provided machine-readable status. If the status is not available, e.g. because
+	// the cluster is unavailable, return an empty map and continue with adding new process groups if required.
+	exclusions, getLocalitiesErr := fdbstatus.GetExcludedLocalitiesFromStatus(logger, cluster, status, r.getAdminClient)
+	if getLocalitiesErr != nil {
+		logger.Error(err, "Error getting exclusion list")
 	}
 
 	hasNewProcessGroups := false
@@ -65,8 +75,8 @@ func (a addProcessGroups) reconcile(ctx context.Context, r *FoundationDBClusterR
 		logger.Info("Adding new Process Groups", "processClass", processClass, "newCount", newCount, "desiredCount", desiredCount, "currentCount", processCounts[processClass])
 		r.Recorder.Event(cluster, corev1.EventTypeNormal, "AddingProcesses", fmt.Sprintf("Adding %d %s processes", newCount, processClass))
 		for i := 0; i < newCount; i++ {
-			processGroupID := cluster.GetNextRandomProcessGroupID(processClass, processGroupIDs[processClass])
-			logger.Info("Adding new Process Group to cluster", "processClass", processClass, "processGroupID", processGroupID)
+			processGroupID := cluster.GetNextRandomProcessGroupIDWithExclusions(processClass, processGroupIDs[processClass], exclusions)
+			logger.Info("Adding new Process Group to cluster", "processClass", processClass, "processGroupID", processGroupID, "exclusions", exclusions)
 			cluster.Status.ProcessGroups = append(cluster.Status.ProcessGroups, fdbv1beta2.NewProcessGroupStatus(processGroupID, processClass, nil))
 		}
 	}
@@ -76,6 +86,10 @@ func (a addProcessGroups) reconcile(ctx context.Context, r *FoundationDBClusterR
 		if err != nil {
 			return &requeue{curError: err}
 		}
+	}
+
+	if getLocalitiesErr != nil {
+		return &requeue{curError: getLocalitiesErr, delayedRequeue: true}
 	}
 
 	return nil

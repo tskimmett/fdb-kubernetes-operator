@@ -24,31 +24,31 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer/yaml"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
-	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
-	"time"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/fdbadminclient"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/podmanager"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/fdbadminclient"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/podmanager"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/internal"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	sigyaml "sigs.k8s.io/yaml"
 
-	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta2"
-	"github.com/FoundationDB/fdb-kubernetes-operator/pkg/podclient"
+	fdbv1beta2 "github.com/FoundationDB/fdb-kubernetes-operator/v2/api/v1beta2"
+	"github.com/FoundationDB/fdb-kubernetes-operator/v2/pkg/podclient"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -77,6 +77,11 @@ type FoundationDBClusterReconciler struct {
 	MinimumRequiredUptimeCCBounce               time.Duration
 	MaintenanceListStaleDuration                time.Duration
 	MaintenanceListWaitDuration                 time.Duration
+	// GlobalSynchronizationWaitDuration is the wait time for the operator when the synchronization mode is set to
+	// global. The wait time defines the period where no updates for the according action should happen. Increasing the
+	// wait time will increase the chances that all updates are part of the list but will also delay the rollout of
+	// the change.
+	GlobalSynchronizationWaitDuration time.Duration
 	// MinimumRecoveryTimeForInclusion defines the duration in seconds that a cluster must be up
 	// before new inclusions are allowed. The operator issuing frequent inclusions in a short time window
 	// could cause instability for the cluster as each inclusion will/can cause a recovery. Delaying the inclusion
@@ -147,7 +152,9 @@ func (r *FoundationDBClusterReconciler) Reconcile(ctx context.Context, request c
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	defer adminClient.Close()
+	defer func() {
+		_ = adminClient.Close()
+	}()
 
 	err = cluster.Validate()
 	if err != nil {
@@ -168,7 +175,7 @@ func (r *FoundationDBClusterReconciler) Reconcile(ctx context.Context, request c
 		clusterLog.Info("Fetch machine-readable status for reconcilitation loop", "cacheStatus", cacheStatus)
 		status, err = r.getStatusFromClusterOrDummyStatus(clusterLog, cluster)
 		if err != nil {
-			clusterLog.Info("could not fetch machine-readable status and therefore didn't cache the it")
+			clusterLog.Info("could not fetch machine-readable status and therefore didn't cache it")
 		}
 	}
 
@@ -414,9 +421,9 @@ func (r *FoundationDBClusterReconciler) updatePodDynamicConf(logger logr.Logger,
 		}
 	}
 
-	syncedFDBcluster, clusterErr := podClient.UpdateFile("fdb.cluster", cluster.Status.ConnectionString)
+	syncedFDBCluster, clusterErr := podClient.UpdateFile("fdb.cluster", cluster.Status.ConnectionString)
 	syncedFDBMonitor, err := podClient.UpdateFile("fdbmonitor.conf", expectedConf)
-	if !syncedFDBcluster || !syncedFDBMonitor {
+	if !syncedFDBCluster || !syncedFDBMonitor {
 		if clusterErr != nil {
 			return false, clusterErr
 		}
@@ -455,11 +462,7 @@ func (r *FoundationDBClusterReconciler) getDatabaseClientProvider() fdbadminclie
 
 // getAdminClient gets the admin client for a reconciler.
 func (r *FoundationDBClusterReconciler) getAdminClient(logger logr.Logger, cluster *fdbv1beta2.FoundationDBCluster) (fdbadminclient.AdminClient, error) {
-	if r.DatabaseClientProvider != nil {
-		return r.DatabaseClientProvider.GetAdminClientWithLogger(cluster, r, logger)
-	}
-
-	panic("Cluster reconciler does not have a DatabaseClientProvider defined")
+	return r.getDatabaseClientProvider().GetAdminClientWithLogger(cluster, r, logger)
 }
 
 func (r *FoundationDBClusterReconciler) getLockClient(logger logr.Logger, cluster *fdbv1beta2.FoundationDBCluster) (fdbadminclient.LockClient, error) {
@@ -467,22 +470,18 @@ func (r *FoundationDBClusterReconciler) getLockClient(logger logr.Logger, cluste
 }
 
 // takeLock attempts to acquire a lock.
-func (r *FoundationDBClusterReconciler) takeLock(logger logr.Logger, cluster *fdbv1beta2.FoundationDBCluster, action string) (bool, error) {
+func (r *FoundationDBClusterReconciler) takeLock(logger logr.Logger, cluster *fdbv1beta2.FoundationDBCluster, action string) error {
+	if !cluster.ShouldUseLocks() {
+		return nil
+	}
+
 	logger.Info("Taking lock on cluster", "action", action)
 	lockClient, err := r.getLockClient(logger, cluster)
 	if err != nil {
-		return false, err
+		return err
 	}
 
-	hasLock, err := lockClient.TakeLock()
-	if err != nil {
-		return false, err
-	}
-
-	if !hasLock {
-		r.Recorder.Event(cluster, corev1.EventTypeNormal, "LockAcquisitionFailed", fmt.Sprintf("Lock required before %s", action))
-	}
-	return hasLock, nil
+	return lockClient.TakeLock()
 }
 
 // releaseLock attempts to release a lock.
@@ -495,8 +494,6 @@ func (r *FoundationDBClusterReconciler) releaseLock(logger logr.Logger, cluster 
 
 	return lockClient.ReleaseLock()
 }
-
-var connectionStringNameRegex, _ = regexp.Compile("[^A-Za-z0-9_]")
 
 // clusterSubReconciler describes a class that does part of the work of
 // reconciliation for a cluster.
@@ -572,24 +569,13 @@ func (r *FoundationDBClusterReconciler) getStatusFromClusterOrDummyStatus(logger
 		}, nil
 	}
 
-	connectionString, err := tryConnectionOptions(logger, cluster, r)
-	if err != nil {
-		return nil, err
-	}
-
-	// Update the connection string if the newly fetched connection string is different from the current one and if the
-	// newly fetched connection string is not empty.
-	if cluster.Status.ConnectionString != connectionString && connectionString != "" {
-		logger.Info("Updating out-of-date connection string", "previousConnectionString", cluster.Status.ConnectionString, "newConnectionString", connectionString)
-		r.Recorder.Event(cluster, corev1.EventTypeNormal, "UpdatingConnectionString", fmt.Sprintf("Setting connection string to %s", connectionString))
-		cluster.Status.ConnectionString = connectionString
-	}
-
 	adminClient, err := r.getAdminClient(logger, cluster)
 	if err != nil {
 		return nil, err
 	}
-	defer adminClient.Close()
+	defer func() {
+		_ = adminClient.Close()
+	}()
 
 	// If the cluster is not yet configured, we can reduce the timeout to make sure the initial reconcile steps
 	// are faster.
@@ -599,6 +585,14 @@ func (r *FoundationDBClusterReconciler) getStatusFromClusterOrDummyStatus(logger
 
 	status, err := adminClient.GetStatus()
 	if err == nil {
+		// Update the connection string if the newly fetched connection string is different from the current one and if the
+		// newly fetched connection string is not empty.
+		if cluster.Status.ConnectionString != status.Cluster.ConnectionString && status.Cluster.ConnectionString != "" {
+			logger.Info("Updating out-of-date connection string", "previousConnectionString", cluster.Status.ConnectionString, "newConnectionString", status.Cluster.ConnectionString)
+			r.Recorder.Event(cluster, corev1.EventTypeNormal, "UpdatingConnectionString", fmt.Sprintf("Setting connection string to %s", status.Cluster.ConnectionString))
+			cluster.Status.ConnectionString = status.Cluster.ConnectionString
+		}
+
 		return status, nil
 	}
 

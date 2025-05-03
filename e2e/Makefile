@@ -10,13 +10,13 @@ TIMEOUT?=168h
 CLUSTER_NAME?=
 NAMESPACE?=
 CONTEXT?=
-FDB_VERSION?=7.1.63
+FDB_VERSION?=7.1.57
 # This will be the version used for upgrade tests.
-NEXT_FDB_VERSION?=7.3.43
+NEXT_FDB_VERSION?=7.3.59
 ## Expectation is that you are running standard build image which generates both regular and debug (Symbols) images.
-FDB_IMAGE?=foundationdb/foundationdb:$(FDB_VERSION)
-UNIFIED_FDB_IMAGE?=foundationdb/fdb-kubernetes-monitor:$(FDB_VERSION)
-SIDECAR_IMAGE?=foundationdb/foundationdb-kubernetes-sidecar:$(FDB_VERSION)-1
+FDB_IMAGE?=foundationdb/foundationdb
+UNIFIED_FDB_IMAGE?=foundationdb/fdb-kubernetes-monitor
+SIDECAR_IMAGE?=foundationdb/foundationdb-kubernetes-sidecar
 OPERATOR_IMAGE?=foundationdb/fdb-kubernetes-operator:latest
 REGISTRY?=docker.io
 CLEANUP?=true
@@ -27,6 +27,7 @@ STORAGE_CLASS?=
 STORAGE_ENGINE?=
 DUMP_OPERATOR_STATE?=true
 SEAWEEDFS_IMAGE?=chrislusf/seaweedfs:3.73
+NODE_SELECTOR?=
 # Defines the cloud provider used for the underlying Kubernetes cluster. Currently only kind is support, other cloud providers
 # should still work but this test framework has no special cases for those.
 CLOUD_PROVIDER?=
@@ -34,8 +35,8 @@ CLOUD_PROVIDER?=
 UPGRADE_VERSIONS?="$(FDB_VERSION):$(NEXT_FDB_VERSION)"
 # Those are feature flags for the operator tests. Enable a feature if you want to run the operator tests with a specific
 # feature enabled e.g. like DNS.
-FEATURE_DNS?=false
-FEATURE_LOCALITIES?=false
+FEATURE_DNS?=
+FEATURE_LOCALITIES?=
 # Allows to specify the tag for a specific FDB version. Format is 7.1.57:7.1.57-testing,7.3.35:7.3.35-debugging
 FDB_VERSION_TAG_MAPPING?=
 # If the FEATURE_SERVER_SIDE_APPLY environment variable is not defined the test suite will be randomly enable (1) or disable (0)
@@ -60,6 +61,18 @@ ifndef STORAGE_ENGINE
     STORAGE_ENGINE="ssd"
   else
     STORAGE_ENGINE="ssd-rocksdb-v1"
+  endif
+endif
+
+# If the FEATURE_SYNCHRONIZATION_MODE environment variable is not defined the test suite will be randomly enable (1) or disable (0)
+# the the global synchronization mode.
+ifndef FEATURE_SYNCHRONIZATION_MODE
+  RANDOM_INT=$(shell shuf -i 0-1 -n 1)
+  ifeq ($(RANDOM_INT), 0)
+    # Default case
+    FEATURE_SYNCHRONIZATION_MODE="local"
+  else
+    FEATURE_SYNCHRONIZATION_MODE="global"
   endif
 endif
 
@@ -131,6 +144,28 @@ nightly-tests: GINKGO_LABEL_FILTER=--ginkgo.label-filter="pr || nightly"
 # Run the actual nightly tests
 nightly-tests: run
 
+# Only run tests that are labeled with the "foundationdb-pr" label, this is used for the cluster tests in the
+# foundationdb repo.
+foundationdb-pr-tests: GINKGO_LABEL_FILTER=--ginkgo.label-filter="foundationdb-pr"
+
+# Run the actual foundationdb-pr tests.
+foundationdb-pr-tests: run
+
+# Only run tests that are labeled with the "foundationdb-nightly" or "foundationdb-pr"  label, this is used for the cluster tests in the
+# foundationdb repo.
+foundationdb-nightly-tests: GINKGO_LABEL_FILTER=--ginkgo.label-filter="foundationdb-pr || foundationdb-nightly"
+
+# Run the actual foundationdb-nightly tests.
+foundationdb-nightly-tests: run
+
+ifdef FEATURE_LOCALITIES
+  FEATURE_LOCALITIES_FLAG=--feature-localities=$(FEATURE_LOCALITIES)
+endif
+
+ifdef FEATURE_DNS
+  FEATURE_DNS_FLAG=--feature-dns=$(FEATURE_DNS)
+endif
+
 %.run: %
 	@sleep $$(shuf -i 1-10 -n 1)
 	go test -timeout=$(TIMEOUT) $(VERBOSE) ./$< \
@@ -153,8 +188,6 @@ nightly-tests: run
 	  --enable-chaos-tests=$(ENABLE_CHAOS_TESTS) \
 	  --upgrade-versions=$(UPGRADE_VERSIONS) \
 	  --feature-unified-image=$(FEATURE_UNIFIED_IMAGE) \
-	  --feature-localities=$(FEATURE_LOCALITIES) \
-	  --feature-dns=$(FEATURE_DNS) \
 	  --cloud-provider=$(CLOUD_PROVIDER) \
 	  --dump-operator-state=$(DUMP_OPERATOR_STATE) \
 	  --cluster-name=$(CLUSTER_NAME) \
@@ -162,5 +195,7 @@ nightly-tests: run
 	  --fdb-version-tag-mapping=$(FDB_VERSION_TAG_MAPPING) \
 	  --unified-fdb-image=$(UNIFIED_FDB_IMAGE) \
 	  --feature-server-side-apply=$(FEATURE_SERVER_SIDE_APPLY) \
-	  --seaweedfs-image=$(SEAWEEDFS_IMAGE) \
+	  --feature-synchronization-mode=$(FEATURE_SYNCHRONIZATION_MODE) \
+	  --seaweedfs-image=$(SEAWEEDFS_IMAGE) $(FEATURE_LOCALITIES_FLAG) $(FEATURE_DNS) \
+	  --node-selector="$(NODE_SELECTOR)" \
 	  | grep -v 'constructing many client instances from the same exec auth config can cause performance problems during cert rotation' &> $(BASE_DIR)/../logs/$<.log
