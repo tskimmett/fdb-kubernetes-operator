@@ -1,4 +1,4 @@
-img="ghcr.io/tskimmett/fdb-operator-arm:v2.4.0" 
+img="ghcr.io/tskimmett/fdb-operator-arm:v2.5.0" 
 
 FDB_VERSION="7.3.56" \
 IMG=$img \
