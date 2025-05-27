@@ -6,7 +6,6 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  creationTimestamp: null
   name: fdb-kubernetes-operator-manager-clusterrole
 rules:
 - apiGroups:
@@ -128,7 +127,6 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  creationTimestamp: null
   name: fdb-kubernetes-operator-manager-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -141,7 +139,6 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  creationTimestamp: null
   name: fdb-kubernetes-operator-manager-clusterrolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -185,10 +182,10 @@ spec:
           name: metrics
         resources:
           limits:
-            cpu: 500m
+            cpu: 200m
             memory: 256Mi
           requests:
-            cpu: 500m
+            cpu: 200m
             memory: 256Mi
         securityContext:
           allowPrivilegeEscalation: false
